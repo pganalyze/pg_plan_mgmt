@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: PostgreSQL ${{ matrix.name }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: "19"
+            branch: REL_19_STABLE
+          - name: master
+            branch: master
+
+    env:
+      PGPREFIX: ${{ github.workspace }}/pginst
+      PG_CONFIG: ${{ github.workspace }}/pginst/bin/pg_config
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v6
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bison flex perl libipc-run-perl pkg-config
+
+      # pg_plan_advice is a PostgreSQL 19 contrib module and PostgreSQL 19 has
+      # no stable packages yet, so build from source. The install is cached
+      # per upstream commit; a cache hit skips the build entirely.
+      - name: Resolve PostgreSQL commit
+        id: pgcommit
+        run: |
+          sha=$(git ls-remote https://github.com/postgres/postgres.git \
+            "refs/heads/${{ matrix.branch }}" | cut -f1)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Restore cached PostgreSQL install
+        id: pgcache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.PGPREFIX }}
+          key: pg-${{ matrix.branch }}-${{ steps.pgcommit.outputs.sha }}-v1
+
+      - name: Build PostgreSQL from source
+        if: steps.pgcache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch ${{ matrix.branch }} \
+            https://github.com/postgres/postgres.git pgsrc
+          cd pgsrc
+          ./configure --prefix="$PGPREFIX" \
+            --enable-debug --enable-cassert --enable-tap-tests \
+            --without-icu --without-readline --without-zlib
+          make -j"$(nproc)"
+          make install
+          make -C contrib/pg_plan_advice install
+
+      - name: Build pg_plan_mgmt
+        run: make PG_CONFIG="$PG_CONFIG" COPT=-Werror
+
+      - name: Install pg_plan_mgmt
+        run: make PG_CONFIG="$PG_CONFIG" install
+
+      - name: Run regression tests
+        run: make PG_CONFIG="$PG_CONFIG" localcheck
+
+      - name: Run TAP tests
+        run: make PG_CONFIG="$PG_CONFIG" tapcheck
+
+      - name: Upload test output on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-output-pg${{ matrix.name }}
+          path: |
+            regression.diffs
+            regression.out
+            results
+            tmp_check/log
+          if-no-files-found: ignore

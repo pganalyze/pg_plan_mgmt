@@ -1,5 +1,7 @@
 # pg_plan_mgmt
 
+[![CI](https://github.com/pganalyze/pg_plan_mgmt/actions/workflows/ci.yml/badge.svg)](https://github.com/pganalyze/pg_plan_mgmt/actions/workflows/ci.yml)
+
 > **Experimental.** This is a first iteration. The SQL interface, GUCs and the
 > on-disk format may still change, and it has not seen production use.
 
