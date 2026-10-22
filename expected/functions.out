@@ -35,7 +35,7 @@ SELECT plan_mgmt.add_plan('EXPLAIN (COSTS OFF) SELECT * FROM pm_dim WHERE id = $
  t
 (1 row)
 
-SELECT status, origin, sql_text, plan_outline FROM plan_mgmt.dba_plans;
+SELECT status, origin, sql_text, plan_outline FROM plan_mgmt.plans;
    status   | origin |              sql_text              |       plan_outline       
 ------------+--------+------------------------------------+--------------------------
  Unapproved | User   | SELECT * FROM pm_dim WHERE id = $1 | BITMAP_HEAP_SCAN(pm_dim)+
@@ -51,7 +51,7 @@ SELECT plan_mgmt.add_plan('SELECT * FROM pm_dim WHERE id = $1',
  t
 (1 row)
 
-SELECT status, enabled FROM plan_mgmt.dba_plans;
+SELECT status, enabled FROM plan_mgmt.plans;
   status  | enabled 
 ----------+---------
  Approved | f
@@ -84,7 +84,7 @@ SELECT valid, detail FROM plan_mgmt.validate_plans() ORDER BY valid;
 (2 rows)
 
 SELECT valid, enabled, last_validated IS NOT NULL AS validated
-  FROM plan_mgmt.dba_plans ORDER BY valid;
+  FROM plan_mgmt.plans ORDER BY valid;
  valid | enabled | validated 
 -------+---------+-----------
  f     | t       | t
@@ -98,7 +98,7 @@ SELECT valid, detail FROM plan_mgmt.validate_plans('disable') ORDER BY valid;
  t     | 
 (2 rows)
 
-SELECT valid, enabled FROM plan_mgmt.dba_plans ORDER BY valid;
+SELECT valid, enabled FROM plan_mgmt.plans ORDER BY valid;
  valid | enabled 
 -------+---------
  f     | f
@@ -112,7 +112,7 @@ SELECT valid, detail FROM plan_mgmt.validate_plans('delete') ORDER BY valid;
  t     | 
 (2 rows)
 
-SELECT valid, enabled FROM plan_mgmt.dba_plans ORDER BY valid;
+SELECT valid, enabled FROM plan_mgmt.plans ORDER BY valid;
  valid | enabled 
 -------+---------
  t     | f
@@ -135,7 +135,7 @@ SELECT valid, detail FROM plan_mgmt.validate_plans() ORDER BY valid;
 (2 rows)
 
 -- Deleting.
-SELECT query_id AS qid, plan_hash AS ph FROM plan_mgmt.dba_plans
+SELECT query_id AS qid, plan_no AS ph FROM plan_mgmt.plans
  WHERE sql_text LIKE '%pm_gone%' \gset
 SELECT plan_mgmt.delete_plan(:qid, :ph);
  delete_plan 
@@ -149,14 +149,14 @@ SELECT plan_mgmt.delete_plan(:qid);
            0
 (1 row)
 
-SELECT query_id AS qid FROM plan_mgmt.dba_plans LIMIT 1 \gset
+SELECT query_id AS qid FROM plan_mgmt.plans LIMIT 1 \gset
 SELECT plan_mgmt.delete_plan(:qid);
  delete_plan 
 -------------
            1
 (1 row)
 
-SELECT count(*) FROM plan_mgmt.dba_plans;
+SELECT count(*) FROM plan_mgmt.plans;
  count 
 -------
      0
@@ -184,7 +184,7 @@ COMMIT;
 CREATE TABLE pm_ctas AS SELECT id FROM pm_dim WHERE val = 2;
 COPY (SELECT val FROM pm_dim WHERE id < 3) TO '/dev/null';
 SET pg_plan_mgmt.capture_plan_baselines = off;
-SELECT sql_text FROM plan_mgmt.dba_plans ORDER BY sql_text;
+SELECT sql_text FROM plan_mgmt.plans ORDER BY sql_text;
                               sql_text                               
 ---------------------------------------------------------------------
  COPY (SELECT val FROM pm_dim WHERE id < 3) TO '/dev/null'
@@ -203,8 +203,8 @@ SELECT valid, detail FROM plan_mgmt.validate_plans();
 (4 rows)
 
 -- Re-adding each plan from its own text finds the same statement.
-SELECT a.query_id = p.query_id AS same_query, a.plan_hash = p.plan_hash AS same_plan
-  FROM plan_mgmt.dba_plans p,
+SELECT a.query_id = p.query_id AS same_query, a.plan_no = p.plan_no AS same_plan
+  FROM plan_mgmt.plans p,
        LATERAL plan_mgmt.add_plan(p.sql_text, p.plan_outline, 'Preferred') a
  ORDER BY p.sql_text;
  same_query | same_plan 
@@ -215,7 +215,7 @@ SELECT a.query_id = p.query_id AS same_query, a.plan_hash = p.plan_hash AS same_
  t          | t
 (4 rows)
 
-SELECT count(*), count(*) FILTER (WHERE status = 'Preferred') FROM plan_mgmt.dba_plans;
+SELECT count(*), count(*) FILTER (WHERE status = 'Preferred') FROM plan_mgmt.plans;
  count | count 
 -------+-------
      4 |     4
@@ -228,7 +228,7 @@ SELECT plan_mgmt.add_plan('SELECT * FROM pm_dim WHERE id = $1', 'SEQ_SCAN(pm_dim
  t
 (1 row)
 
-SELECT count(*) FROM plan_mgmt.dba_plans;
+SELECT count(*) FROM plan_mgmt.plans;
  count 
 -------
      5
@@ -245,9 +245,9 @@ SELECT plan_mgmt.reset();
 -- Functions are not available to unprivileged users by default.
 CREATE ROLE regress_pm_user;
 SET ROLE regress_pm_user;
-SELECT * FROM plan_mgmt.dba_plans;
+SELECT * FROM plan_mgmt.plans;
 ERROR:  permission denied for schema plan_mgmt
-LINE 1: SELECT * FROM plan_mgmt.dba_plans;
+LINE 1: SELECT * FROM plan_mgmt.plans;
                       ^
 SELECT plan_mgmt.reset();
 ERROR:  permission denied for schema plan_mgmt

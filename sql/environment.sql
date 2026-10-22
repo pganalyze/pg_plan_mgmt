@@ -1,0 +1,103 @@
+-- Statements are re-planned in the environment they were captured in: the
+-- search_path and the role. Both change what the planner sees, through name
+-- resolution, row-level security and function inlining.
+
+-- Two schemas with a table of the same name; only one has the index.
+CREATE SCHEMA pm_s1;
+CREATE SCHEMA pm_s2;
+CREATE TABLE pm_s1.pm_env (id int PRIMARY KEY, v int)
+	WITH (autovacuum_enabled = false);
+CREATE TABLE pm_s2.pm_env (id int PRIMARY KEY, v int)
+	WITH (autovacuum_enabled = false);
+INSERT INTO pm_s1.pm_env SELECT g, g % 10 FROM generate_series(1, 10000) g;
+INSERT INTO pm_s2.pm_env SELECT g, g % 10 FROM generate_series(1, 10000) g;
+CREATE INDEX pm_env_v_idx ON pm_s1.pm_env (v);
+VACUUM ANALYZE pm_s1.pm_env, pm_s2.pm_env;
+
+SET search_path = pm_s1, public;
+SET pg_plan_mgmt.capture_plan_baselines = manual;
+SELECT count(*) FROM pm_env WHERE v = 1;
+SET pg_plan_mgmt.capture_plan_baselines = off;
+SELECT sql_text, search_path, role_name = current_user AS captured_as_me,
+       plan_outline
+  FROM plan_mgmt.plans;
+
+-- Validation uses the captured search_path, not the session's, so the index
+-- is found even though pm_s2.pm_env has none.
+SET search_path = pm_s2, public;
+SELECT valid, detail FROM plan_mgmt.validate_plans();
+
+-- add_plan uses the session's environment unless told otherwise.
+SELECT plan_mgmt.add_plan('SELECT count(*) FROM pm_env WHERE v = 2',
+						  'INDEX_SCAN(pm_env pm_s1.pm_env_v_idx)');
+SELECT plan_no FROM plan_mgmt.add_plan('SELECT count(*) FROM pm_env WHERE v = 2',
+									   'INDEX_SCAN(pm_env pm_s1.pm_env_v_idx)',
+									   search_path => 'pm_s1, public');
+-- A statement is always recorded with a role; validate_plans would otherwise
+-- plan it as whoever runs it.
+SELECT plan_mgmt.add_plan('SELECT count(*) FROM pm_env WHERE v = 2',
+						  'INDEX_SCAN(pm_env pm_s1.pm_env_v_idx)',
+						  role_name => '');
+RESET search_path;
+SELECT plan_mgmt.reset();
+
+-- A row-level security policy applies to the application role only, and
+-- changes the plan. The DBA validating the plan must see what the
+-- application sees.
+CREATE ROLE regress_pm_app;
+CREATE TABLE pm_rls (id int PRIMARY KEY, owner_v int)
+	WITH (autovacuum_enabled = false);
+INSERT INTO pm_rls SELECT g, g FROM generate_series(1, 10000) g;
+CREATE INDEX pm_rls_owner_v_idx ON pm_rls (owner_v);
+VACUUM ANALYZE pm_rls;
+ALTER TABLE pm_rls ENABLE ROW LEVEL SECURITY;
+CREATE POLICY pm_rls_app ON pm_rls FOR SELECT TO regress_pm_app
+	USING (owner_v = 5);
+GRANT SELECT ON pm_rls TO regress_pm_app;
+
+SET pg_plan_mgmt.capture_plan_baselines = manual;
+SET ROLE regress_pm_app;
+SELECT count(*) FROM pm_rls WHERE id < 100;
+RESET ROLE;
+SET pg_plan_mgmt.capture_plan_baselines = off;
+SELECT role_name, plan_outline FROM plan_mgmt.plans;
+
+-- Without the policy the plan would differ; validated as the captured role
+-- it is reproduced.
+SELECT valid, detail FROM plan_mgmt.validate_plans();
+
+-- A caller who cannot assume the role gets no verdict, and the plan is left
+-- alone.
+CREATE ROLE regress_pm_other;
+GRANT USAGE ON SCHEMA plan_mgmt TO regress_pm_other;
+GRANT EXECUTE ON FUNCTION plan_mgmt.validate_plans(text) TO regress_pm_other;
+SELECT last_validated AS validated_before FROM plan_mgmt.plans \gset
+SET ROLE regress_pm_other;
+SELECT valid, detail FROM plan_mgmt.validate_plans();
+RESET ROLE;
+SELECT valid, last_validated = :'validated_before' AS untouched
+  FROM plan_mgmt.plans;
+
+-- Nor does such a caller see the statement's text, until it has the
+-- captured role's privileges.
+GRANT SELECT ON plan_mgmt.plans TO regress_pm_other;
+GRANT EXECUTE ON FUNCTION plan_mgmt.get_plans() TO regress_pm_other;
+SET ROLE regress_pm_other;
+SELECT sql_text, plan_outline FROM plan_mgmt.plans;
+RESET ROLE;
+GRANT regress_pm_app TO regress_pm_other;
+SET ROLE regress_pm_other;
+SELECT sql_text FROM plan_mgmt.plans;
+RESET ROLE;
+
+-- Likewise once the role is gone.
+DROP OWNED BY regress_pm_app;
+DROP ROLE regress_pm_app;
+SELECT valid, detail FROM plan_mgmt.validate_plans();
+
+SELECT plan_mgmt.reset();
+DROP TABLE pm_rls;
+DROP SCHEMA pm_s1 CASCADE;
+DROP SCHEMA pm_s2 CASCADE;
+DROP OWNED BY regress_pm_other;
+DROP ROLE regress_pm_other;

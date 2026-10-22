@@ -31,16 +31,16 @@ SELECT count(*) FROM t WHERE id < 900;
 });
 
 my $before = $node->safe_psql('postgres', q{
-SELECT query_id, plan_hash, status, enabled, origin, sql_text, plan_outline
-  FROM plan_mgmt.dba_plans ORDER BY plan_hash});
-is($node->safe_psql('postgres', 'SELECT count(*) FROM plan_mgmt.dba_plans'),
+SELECT query_id, plan_no, status, enabled, origin, sql_text, plan_outline
+  FROM plan_mgmt.plans ORDER BY plan_no});
+is($node->safe_psql('postgres', 'SELECT count(*) FROM plan_mgmt.plans'),
 	'2', 'two plans captured');
 
 # Change something so we can tell it was persisted.
 $node->safe_psql('postgres', q{
-SELECT plan_mgmt.set_plan_status(query_id, plan_hash,
+SELECT plan_mgmt.set_plan_status(query_id, plan_no,
 		CASE status WHEN 'Approved' THEN 'Rejected' ELSE 'Preferred' END)
-  FROM plan_mgmt.dba_plans});
+  FROM plan_mgmt.plans});
 $before =~ s/\|Approved\|/|Rejected|/;
 $before =~ s/\|Unapproved\|/|Preferred|/;
 
@@ -48,8 +48,8 @@ $node->restart;
 ok(-f $node->data_dir . '/pg_plan_mgmt.tsv', 'dump file written at shutdown');
 
 my $after = $node->safe_psql('postgres', q{
-SELECT query_id, plan_hash, status, enabled, origin, sql_text, plan_outline
-  FROM plan_mgmt.dba_plans ORDER BY plan_hash});
+SELECT query_id, plan_no, status, enabled, origin, sql_text, plan_outline
+  FROM plan_mgmt.plans ORDER BY plan_no});
 is($after, $before, 'plans restored after restart');
 
 # A restored Preferred plan is enforced.
@@ -94,7 +94,7 @@ $log_offset = -s $node->logfile;
 $node->start;
 $node->wait_for_log(qr/pg_plan_mgmt deleted 2 plans not used in the last 32 days/,
 	$log_offset);
-is($node->safe_psql('postgres', 'SELECT count(*) FROM plan_mgmt.dba_plans'),
+is($node->safe_psql('postgres', 'SELECT count(*) FROM plan_mgmt.plans'),
 	'0', 'unused plans deleted');
 
 $node->stop;

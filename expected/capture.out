@@ -1,5 +1,5 @@
 CREATE EXTENSION pg_plan_mgmt;
--- EXPLAIN without costs, with plan hashes masked.
+-- EXPLAIN without costs.
 CREATE FUNCTION explain_masked(query text) RETURNS SETOF text
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -7,7 +7,7 @@ DECLARE
 BEGIN
 	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || query
 	LOOP
-		RETURN NEXT regexp_replace(ln, '-?\d{4,}', 'N', 'g');
+		RETURN NEXT ln;
 	END LOOP;
 END;
 $$;
@@ -31,7 +31,7 @@ SELECT explain_masked('SELECT * FROM pm_fact f JOIN pm_dim d ON f.dim_id = d.id 
                Filter: (val = 1)
 (6 rows)
 
-SELECT count(*) FROM plan_mgmt.dba_plans;
+SELECT count(*) FROM plan_mgmt.plans;
  count 
 -------
      0
@@ -48,11 +48,11 @@ SELECT explain_masked('SELECT * FROM pm_fact f JOIN pm_dim d ON f.dim_id = d.id 
    ->  Hash
          ->  Seq Scan on pm_dim d
                Filter: (val = 1)
- Plan Hash: N (Approved)
+ Baseline Plan: 1 (Approved)
 (7 rows)
 
 SELECT status, origin, enabled, valid, sql_text, plan_outline
-  FROM plan_mgmt.dba_plans;
+  FROM plan_mgmt.plans;
   status  | origin | enabled | valid |                                 sql_text                                 |  plan_outline   
 ----------+--------+---------+-------+--------------------------------------------------------------------------+-----------------
  Approved | Manual | t       | t     | SELECT * FROM pm_fact f JOIN pm_dim d ON f.dim_id = d.id WHERE d.val = 1 | JOIN_ORDER(f d)+
@@ -71,10 +71,10 @@ SELECT explain_masked('SELECT * FROM pm_fact f JOIN pm_dim d ON f.dim_id = d.id 
    ->  Hash
          ->  Seq Scan on pm_dim d
                Filter: (val = 2)
- Plan Hash: N (Approved)
+ Baseline Plan: 1 (Approved)
 (7 rows)
 
-SELECT count(*) FROM plan_mgmt.dba_plans;
+SELECT count(*) FROM plan_mgmt.plans;
  count 
 -------
      1
@@ -91,12 +91,12 @@ SELECT explain_masked('SELECT * FROM pm_fact f JOIN pm_dim d ON f.dim_id = d.id 
          Filter: (val = 1)
    ->  Index Scan using pm_fact_dim_id_idx on pm_fact f
          Index Cond: (dim_id = d.id)
- Plan Hash: N (Unapproved)
+ Baseline Plan: 2 (Unapproved)
 (6 rows)
 
 RESET random_page_cost;
 RESET cpu_index_tuple_cost;
-SELECT status, origin, plan_outline FROM plan_mgmt.dba_plans
+SELECT status, origin, plan_outline FROM plan_mgmt.plans
  ORDER BY status, plan_outline;
    status   | origin |                         plan_outline                         
 ------------+--------+--------------------------------------------------------------
@@ -123,7 +123,7 @@ SELECT * FROM pm_temp;
 ---
 (0 rows)
 
-SELECT count(*) FROM plan_mgmt.dba_plans;
+SELECT count(*) FROM plan_mgmt.plans;
  count 
 -------
      2
@@ -146,7 +146,7 @@ SELECT 1 \; SELECT count(*) FROM pm_dim WHERE val = 3 \; SELECT 2;
         2
 (1 row)
 
-SELECT sql_text FROM plan_mgmt.dba_plans WHERE sql_text LIKE '%val = 3%';
+SELECT sql_text FROM plan_mgmt.plans WHERE sql_text LIKE '%val = 3%';
                  sql_text                  
 -------------------------------------------
  SELECT count(*) FROM pm_dim WHERE val = 3
@@ -166,7 +166,7 @@ SELECT count(*) FROM pm_fact WHERE dim_id = 5;
     20
 (1 row)
 
-SELECT count(*) FROM plan_mgmt.dba_plans;
+SELECT count(*) FROM plan_mgmt.plans;
  count 
 -------
      0
@@ -178,22 +178,65 @@ SELECT count(*) FROM pm_fact WHERE dim_id = 6;
     20
 (1 row)
 
-SELECT status, origin, sql_text FROM plan_mgmt.dba_plans;
+SELECT status, origin, sql_text FROM plan_mgmt.plans;
   status  |  origin   |                   sql_text                    
 ----------+-----------+-----------------------------------------------
  Approved | Automatic | SELECT count(*) FROM pm_fact WHERE dim_id = 5
 (1 row)
 
 -- Capture is privileged.
-CREATE ROLE regress_pm_user;
+CREATE ROLE regress_pm_user LOGIN;
 SET ROLE regress_pm_user;
 SET pg_plan_mgmt.capture_plan_baselines = manual;
 ERROR:  permission denied to set parameter "pg_plan_mgmt.capture_plan_baselines"
-SELECT * FROM plan_mgmt.dba_plans;
+SELECT * FROM plan_mgmt.plans;
 ERROR:  permission denied for schema plan_mgmt
-LINE 1: SELECT * FROM plan_mgmt.dba_plans;
+LINE 1: SELECT * FROM plan_mgmt.plans;
                       ^
 RESET ROLE;
+-- Even with automatic capture configured for the database, nothing a
+-- non-superuser session plans is captured, and the text of statements
+-- captured by others is hidden from it.
+GRANT USAGE ON SCHEMA plan_mgmt TO regress_pm_user;
+GRANT SELECT ON plan_mgmt.plans TO regress_pm_user;
+GRANT EXECUTE ON FUNCTION plan_mgmt.get_plans() TO regress_pm_user;
+GRANT SELECT ON pm_fact TO regress_pm_user;
+SELECT current_database() AS db, current_user AS su \gset
+ALTER DATABASE :"db" SET pg_plan_mgmt.capture_plan_baselines = automatic;
+\c - regress_pm_user
+SHOW pg_plan_mgmt.capture_plan_baselines;
+ pg_plan_mgmt.capture_plan_baselines 
+-------------------------------------
+ automatic
+(1 row)
+
+SELECT count(*) FROM pm_fact WHERE dim_id = 7;
+ count 
+-------
+    20
+(1 row)
+
+SELECT count(*) FROM pm_fact WHERE dim_id = 7;
+ count 
+-------
+    20
+(1 row)
+
+SELECT sql_text FROM plan_mgmt.plans;
+         sql_text         
+--------------------------
+ <insufficient privilege>
+(1 row)
+
+\c - :su
+ALTER DATABASE :"db" RESET pg_plan_mgmt.capture_plan_baselines;
+SELECT sql_text FROM plan_mgmt.plans;
+                   sql_text                    
+-----------------------------------------------
+ SELECT count(*) FROM pm_fact WHERE dim_id = 5
+(1 row)
+
+DROP OWNED BY regress_pm_user;
 DROP ROLE regress_pm_user;
 SET pg_plan_mgmt.capture_plan_baselines = off;
 SELECT plan_mgmt.reset();

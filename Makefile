@@ -13,7 +13,7 @@ EXTENSION = pg_plan_mgmt
 DATA = pg_plan_mgmt--1.0.sql
 PGFILEDESC = "pg_plan_mgmt - plan baselines built on pg_plan_advice"
 
-REGRESS = capture enforce pruning functions
+REGRESS = capture enforce pruning functions environment
 REGRESS_OPTS = --temp-config $(srcdir)/pg_plan_mgmt.conf
 TAP_TESTS = 1
 

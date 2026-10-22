@@ -11,9 +11,10 @@
  * The file is TSV, starting with a header line, then one line per
  * statement followed by one line per plan:
  *
- *   pg_plan_mgmt	1
- *   stmt	dbid	query_id	created	plannings	sql_text
- *   plan	dbid	query_id	plan_hash	status	origin	enabled	valid	cost
+ *   pg_plan_mgmt	2
+ *   stmt	dbid	query_id	created	plannings	next_plan_no	sql_text
+ *		search_path	role_name
+ *   plan	dbid	query_id	plan_no	status	origin	enabled	valid	cost
  *		created	last_used	last_validated	plan_count	failures	outline
  *
  * Copyright (c) 2026, Duboce Labs, Inc. (pganalyze) <team@pganalyze.com>
@@ -41,8 +42,8 @@
 #include "utils/timestamp.h"
 #include "utils/wait_event.h"
 
-#define PGPM_FILE_HEADER	"pg_plan_mgmt\t1"
-#define PGPM_STMT_FIELDS	6
+#define PGPM_FILE_HEADER	"pg_plan_mgmt\t2"
+#define PGPM_STMT_FIELDS	9
 #define PGPM_PLAN_FIELDS	15
 
 /* Delete unused plans at most this often. */
@@ -56,8 +57,11 @@ typedef struct pgpm_saved_line
 	bool		is_plan;
 	pgpm_stmt_key key;
 	char	   *sql_text;
+	char	   *search_path;
+	char	   *role_name;
 	TimestampTz created;
 	uint64		plannings;
+	int			next_plan_no;
 	pgpm_plan_info plan;
 } pgpm_saved_line;
 
@@ -314,8 +318,17 @@ pgpm_read_from_disk(void)
 			sl->key.queryId = pgpm_parse_int64(fields[2], lineno);
 			sl->created = (TimestampTz) pgpm_parse_int64(fields[3], lineno);
 			sl->plannings = (uint64) pgpm_parse_int64(fields[4], lineno);
-			pgpm_unescape_tsv_field(fields[5], lineno);
-			sl->sql_text = fields[5];
+			sl->next_plan_no = (int) pgpm_parse_int64(fields[5], lineno);
+			if (sl->next_plan_no < 1)
+				pgpm_syntax_error(lineno, "invalid plan number");
+			pgpm_unescape_tsv_field(fields[6], lineno);
+			sl->sql_text = fields[6];
+			pgpm_unescape_tsv_field(fields[7], lineno);
+			sl->search_path = fields[7];
+			pgpm_unescape_tsv_field(fields[8], lineno);
+			if (fields[8][0] == '\0')
+				pgpm_syntax_error(lineno, "empty role name");
+			sl->role_name = fields[8];
 			num_stmts++;
 		}
 		else if (strcmp(fields[0], "plan") == 0)
@@ -330,7 +343,9 @@ pgpm_read_from_disk(void)
 			sl->is_plan = true;
 			sl->key.dbid = (Oid) pgpm_parse_int64(fields[1], lineno);
 			sl->key.queryId = pgpm_parse_int64(fields[2], lineno);
-			plan->plan_hash = pgpm_parse_int64(fields[3], lineno);
+			plan->plan_no = (int) pgpm_parse_int64(fields[3], lineno);
+			if (plan->plan_no < 1)
+				pgpm_syntax_error(lineno, "invalid plan number");
 			plan->status = fields[4][0];
 			if (strlen(fields[4]) != 1 ||
 				strcmp(pgpm_status_name(plan->status), "Unknown") == 0)
@@ -370,13 +385,14 @@ pgpm_read_from_disk(void)
 		pgpm_saved_line *sl = &lines[i];
 
 		if (!sl->is_plan)
-			pgpm_store_put_stmt(&sl->key, sl->sql_text, sl->created,
-								sl->plannings, false);
+			pgpm_store_put_stmt(&sl->key, sl->sql_text, sl->search_path,
+								sl->role_name, sl->created, sl->plannings,
+								sl->next_plan_no, false);
 		else if (!pgpm_store_put_plan(&sl->key, &sl->plan, false))
 			ereport(ERROR,
 					errcode(ERRCODE_DATA_CORRUPTED),
-					errmsg("plan %" PRId64 " in file \"%s\" belongs to unknown statement %" PRId64,
-						   sl->plan.plan_hash, PGPM_DUMP_FILE,
+					errmsg("plan %d in file \"%s\" belongs to unknown statement %" PRId64,
+						   sl->plan.plan_no, PGPM_DUMP_FILE,
 						   sl->key.queryId));
 	}
 
@@ -423,10 +439,15 @@ pgpm_write_to_disk(void)
 
 	foreach_ptr(pgpm_stmt_info, stmt, stmts)
 	{
-		appendStringInfo(&buf, "stmt\t%u\t%" PRId64 "\t%" PRId64 "\t%" PRIu64 "\t",
+		appendStringInfo(&buf, "stmt\t%u\t%" PRId64 "\t%" PRId64 "\t%" PRIu64 "\t%d\t",
 						 stmt->key.dbid, stmt->key.queryId,
-						 (int64) stmt->created, stmt->plannings);
+						 (int64) stmt->created, stmt->plannings,
+						 stmt->next_plan_no);
 		pgpm_append_tsv_escaped_string(&buf, stmt->sql_text);
+		appendStringInfoChar(&buf, '\t');
+		pgpm_append_tsv_escaped_string(&buf, stmt->search_path);
+		appendStringInfoChar(&buf, '\t');
+		pgpm_append_tsv_escaped_string(&buf, stmt->role_name);
 		appendStringInfoChar(&buf, '\n');
 		num_stmts++;
 
@@ -435,9 +456,9 @@ pgpm_write_to_disk(void)
 			pgpm_plan_info *plan = &stmt->plans[i];
 
 			appendStringInfo(&buf,
-							 "plan\t%u\t%" PRId64 "\t%" PRId64 "\t%c\t%c\t%c\t%c\t%.17g\t%" PRId64 "\t%" PRId64 "\t%" PRId64 "\t%" PRIu64 "\t%" PRIu64 "\t",
+							 "plan\t%u\t%" PRId64 "\t%d\t%c\t%c\t%c\t%c\t%.17g\t%" PRId64 "\t%" PRId64 "\t%" PRId64 "\t%" PRIu64 "\t%" PRIu64 "\t",
 							 stmt->key.dbid, stmt->key.queryId,
-							 plan->plan_hash, plan->status, plan->origin,
+							 plan->plan_no, plan->status, plan->origin,
 							 plan->enabled ? 't' : 'f',
 							 plan->valid ? 't' : 'f',
 							 plan->total_cost, (int64) plan->created,

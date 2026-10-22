@@ -9,7 +9,7 @@ SELECT explain_masked('SELECT * FROM pm_fact f JOIN pm_dim d ON f.dim_id = d.id 
    ->  Hash
          ->  Seq Scan on pm_dim d
                Filter: (val = 1)
- Plan Hash: N (Approved)
+ Baseline Plan: 1 (Approved)
 (7 rows)
 
 SET random_page_cost = 0.1;
@@ -22,13 +22,13 @@ SELECT explain_masked('SELECT * FROM pm_fact f JOIN pm_dim d ON f.dim_id = d.id 
          Filter: (val = 1)
    ->  Index Scan using pm_fact_dim_id_idx on pm_fact f
          Index Cond: (dim_id = d.id)
- Plan Hash: N (Unapproved)
+ Baseline Plan: 2 (Unapproved)
 (6 rows)
 
 SET pg_plan_mgmt.capture_plan_baselines = off;
-SELECT query_id AS qid FROM plan_mgmt.dba_plans LIMIT 1 \gset
-SELECT plan_hash AS approved FROM plan_mgmt.dba_plans WHERE status = 'Approved' \gset
-SELECT plan_hash AS unapproved FROM plan_mgmt.dba_plans WHERE status = 'Unapproved' \gset
+SELECT query_id AS qid FROM plan_mgmt.plans LIMIT 1 \gset
+SELECT plan_no AS approved FROM plan_mgmt.plans WHERE status = 'Approved' \gset
+SELECT plan_no AS unapproved FROM plan_mgmt.plans WHERE status = 'Unapproved' \gset
 -- Under the changed costs, the Approved plan is enforced.
 SET pg_plan_mgmt.use_plan_baselines = on;
 SELECT explain_masked('SELECT * FROM pm_fact f JOIN pm_dim d ON f.dim_id = d.id WHERE d.val = 1');
@@ -48,7 +48,7 @@ SELECT explain_masked('SELECT * FROM pm_fact f JOIN pm_dim d ON f.dim_id = d.id 
    NO_GATHER(f) /* matched */
    NO_GATHER(d) /* matched */
  Plan Management: Approved plan used instead of minimum-cost plan
- Plan Hash: N (Approved), Minimum-Cost Plan Hash: N (Unapproved)
+ Baseline Plan: 1 (Approved), Minimum-Cost Plan: 2 (Unapproved)
 (15 rows)
 
 SELECT count(*) FROM pm_fact f JOIN pm_dim d ON f.dim_id = d.id WHERE d.val = 1;
@@ -57,6 +57,22 @@ SELECT count(*) FROM pm_fact f JOIN pm_dim d ON f.dim_id = d.id WHERE d.val = 1;
   2000
 (1 row)
 
+-- The same decision in a structured format.
+DO $$
+DECLARE
+	j jsonb;
+BEGIN
+	EXECUTE 'EXPLAIN (COSTS OFF, FORMAT JSON) SELECT * FROM pm_fact f JOIN pm_dim d ON f.dim_id = d.id WHERE d.val = 1' INTO j;
+	RAISE NOTICE '%', jsonb_pretty((j -> 0) - 'Plan' - 'Supplied Plan Advice');
+END;
+$$;
+NOTICE:  {
+    "Plan Management": "Approved plan used instead of minimum-cost plan",
+    "Baseline Plan Number": 1,
+    "Baseline Plan Status": "Approved",
+    "Minimum-Cost Plan Number": 2,
+    "Minimum-Cost Plan Status": "Unapproved"
+}
 -- A cheap enough Unapproved plan may run.
 SET pg_plan_mgmt.unapproved_plan_execution_threshold = 1e9;
 SELECT explain_masked('SELECT * FROM pm_fact f JOIN pm_dim d ON f.dim_id = d.id WHERE d.val = 1');
@@ -68,7 +84,7 @@ SELECT explain_masked('SELECT * FROM pm_fact f JOIN pm_dim d ON f.dim_id = d.id 
    ->  Index Scan using pm_fact_dim_id_idx on pm_fact f
          Index Cond: (dim_id = d.id)
  Plan Management: Unapproved plan used because its cost is below unapproved_plan_execution_threshold
- Plan Hash: N (Unapproved)
+ Baseline Plan: 2 (Unapproved)
 (7 rows)
 
 RESET pg_plan_mgmt.unapproved_plan_execution_threshold;
@@ -87,7 +103,7 @@ SELECT explain_masked('SELECT * FROM pm_fact f JOIN pm_dim d ON f.dim_id = d.id 
          Filter: (val = 1)
    ->  Index Scan using pm_fact_dim_id_idx on pm_fact f
          Index Cond: (dim_id = d.id)
- Plan Hash: N (Approved)
+ Baseline Plan: 2 (Approved)
 (6 rows)
 
 -- A Preferred plan wins over the minimum-cost plan unless that is approved.
@@ -120,7 +136,7 @@ SELECT explain_masked('SELECT * FROM pm_fact f JOIN pm_dim d ON f.dim_id = d.id 
    NO_GATHER(f) /* matched */
    NO_GATHER(d) /* matched */
  Plan Management: Preferred plan used instead of minimum-cost plan
- Plan Hash: N (Preferred), Minimum-Cost Plan Hash: N (Rejected)
+ Baseline Plan: 1 (Preferred), Minimum-Cost Plan: 2 (Rejected)
 (15 rows)
 
 -- Disabled plans are not used.
@@ -139,7 +155,7 @@ SELECT explain_masked('SELECT * FROM pm_fact f JOIN pm_dim d ON f.dim_id = d.id 
    ->  Index Scan using pm_fact_dim_id_idx on pm_fact f
          Index Cond: (dim_id = d.id)
  Plan Management: No approved plan is available, minimum-cost plan used
- Plan Hash: N (Rejected)
+ Baseline Plan: 2 (Rejected)
 (7 rows)
 
 SELECT plan_mgmt.set_plan_enabled(:qid, :approved, true);
@@ -164,15 +180,15 @@ SELECT explain_masked('EXECUTE pm_stmt(1)');
 SELECT plan_mgmt.add_plan(
 	'SELECT * FROM pm_fact f JOIN pm_dim d ON f.dim_id = d.id WHERE d.val = $1',
 	plan_outline, 'Approved') IS NOT NULL
-  FROM plan_mgmt.dba_plans WHERE plan_hash = :approved;
+  FROM plan_mgmt.plans WHERE plan_no = :approved;
  ?column? 
 ----------
  t
 (1 row)
 
 SELECT explain_masked('EXECUTE pm_stmt(1)');
-                          explain_masked                           
--------------------------------------------------------------------
+                          explain_masked                          
+------------------------------------------------------------------
  Hash Join
    Hash Cond: (f.dim_id = d.id)
    ->  Seq Scan on pm_fact f
@@ -187,7 +203,7 @@ SELECT explain_masked('EXECUTE pm_stmt(1)');
    NO_GATHER(f) /* matched */
    NO_GATHER(d) /* matched */
  Plan Management: Approved plan used instead of minimum-cost plan
- Plan Hash: N (Approved), Minimum-Cost Plan Hash: N (Not Captured)
+ Baseline Plan: 1 (Approved), Minimum-Cost Plan: not captured
 (15 rows)
 
 DEALLOCATE pm_stmt;
@@ -212,7 +228,7 @@ SELECT explain_masked('SELECT * FROM pm_fact f JOIN pm_dim d ON f.dim_id = d.id 
          Filter: (val = 1)
    ->  Index Scan using pm_fact_dim_id_idx on pm_fact f
          Index Cond: (dim_id = d.id)
- Plan Hash: N (Preferred)
+ Baseline Plan: 2 (Preferred)
 (6 rows)
 
 DROP INDEX pm_fact_dim_id_idx;
@@ -226,10 +242,10 @@ SELECT explain_masked('SELECT * FROM pm_fact f JOIN pm_dim d ON f.dim_id = d.id 
          ->  Index Scan using pm_dim_pkey on pm_dim d
                Filter: (val = 1)
  Plan Management: No approved plan could be enforced, minimum-cost plan used
- Plan Hash: N (Not Captured)
+ Baseline Plan: not captured
 (8 rows)
 
-SELECT status, enforcement_failures > 0 AS failed FROM plan_mgmt.dba_plans
+SELECT status, enforcement_failures > 0 AS failed FROM plan_mgmt.plans
  WHERE query_id = :qid ORDER BY status;
   status   | failed 
 -----------+--------

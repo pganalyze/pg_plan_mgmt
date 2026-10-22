@@ -18,11 +18,11 @@ SELECT explain_masked('SELECT count(*) FROM pm_part WHERE k = 1 AND v = 1');
    ->  Index Scan using pm_part1_v_idx on pm_part1 pm_part
          Index Cond: (v = 1)
          Filter: (k = 1)
- Plan Hash: N (Approved)
+ Baseline Plan: 1 (Approved)
 (5 rows)
 
 SET pg_plan_mgmt.capture_plan_baselines = off;
-SELECT status, plan_outline FROM plan_mgmt.dba_plans;
+SELECT status, plan_outline FROM plan_mgmt.plans;
   status  |                       plan_outline                        
 ----------+-----------------------------------------------------------
  Approved | INDEX_SCAN(pm_part/public.pm_part1 public.pm_part1_v_idx)+
@@ -48,7 +48,7 @@ SELECT explain_masked('SELECT count(*) FROM pm_part WHERE k = 1 AND v = 1');
    NO_GATHER(pm_part) /* matched */
    NO_GATHER(pm_part/public.pm_part1) /* matched */
  Plan Management: Approved plan used instead of minimum-cost plan
- Plan Hash: N (Approved), Minimum-Cost Plan Hash: N (Not Captured)
+ Baseline Plan: 1 (Approved), Minimum-Cost Plan: not captured
 (12 rows)
 
 -- Other partition: the outline produces a different plan, which must not be
@@ -60,10 +60,10 @@ SELECT explain_masked('SELECT count(*) FROM pm_part WHERE k = 2 AND v = 1');
    ->  Seq Scan on pm_part2 pm_part
          Filter: ((k = 2) AND (v = 1))
  Plan Management: No approved plan could be enforced, minimum-cost plan used
- Plan Hash: N (Not Captured)
+ Baseline Plan: not captured
 (5 rows)
 
-SELECT status, plan_count, enforcement_failures FROM plan_mgmt.dba_plans;
+SELECT status, plan_count, enforcement_failures FROM plan_mgmt.plans;
   status  | plan_count | enforcement_failures 
 ----------+------------+----------------------
  Approved |          2 |                    1

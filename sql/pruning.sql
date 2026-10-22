@@ -14,7 +14,7 @@ VACUUM ANALYZE pm_part1, pm_part2;
 SET pg_plan_mgmt.capture_plan_baselines = manual;
 SELECT explain_masked('SELECT count(*) FROM pm_part WHERE k = 1 AND v = 1');
 SET pg_plan_mgmt.capture_plan_baselines = off;
-SELECT status, plan_outline FROM plan_mgmt.dba_plans;
+SELECT status, plan_outline FROM plan_mgmt.plans;
 
 SET enable_indexscan = off;
 SET enable_bitmapscan = off;
@@ -26,7 +26,7 @@ SELECT explain_masked('SELECT count(*) FROM pm_part WHERE k = 1 AND v = 1');
 -- Other partition: the outline produces a different plan, which must not be
 -- passed off as the approved one.
 SELECT explain_masked('SELECT count(*) FROM pm_part WHERE k = 2 AND v = 1');
-SELECT status, plan_count, enforcement_failures FROM plan_mgmt.dba_plans;
+SELECT status, plan_count, enforcement_failures FROM plan_mgmt.plans;
 
 RESET enable_indexscan;
 RESET enable_bitmapscan;

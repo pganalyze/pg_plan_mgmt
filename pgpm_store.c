@@ -46,13 +46,15 @@ static bool warned_limit = false;
 
 static void pgpm_init_shared_state(void *ptr, void *arg);
 static void pgpm_init_key(pgpm_stmt_key *key, Oid dbid, int64 queryId);
-static void pgpm_init_stmt(pgpm_stmt *stmt, dsa_pointer sql_text,
-						   TimestampTz created, uint64 plannings);
 static pgpm_stmt *pgpm_insert_stmt(pgpm_stmt_key *key, const char *sql_text,
+								   const char *search_path,
+								   const char *role_name,
 								   bool enforce_limits, bool *found);
 static pgpm_plan *pgpm_stmt_plans(pgpm_stmt *stmt);
-static int	pgpm_find_plan(pgpm_stmt *stmt, int64 plan_hash);
-static pgpm_plan *pgpm_append_plan(pgpm_stmt *stmt, bool enforce_limits);
+static int	pgpm_find_plan(pgpm_stmt *stmt, int plan_no);
+static int	pgpm_find_plan_by_outline(pgpm_stmt *stmt, const char *outline);
+static pgpm_plan *pgpm_append_plan(pgpm_stmt *stmt, int plan_no,
+								   bool enforce_limits);
 static void pgpm_remove_plan(pgpm_stmt *stmt, int idx);
 static void pgpm_free_stmt(pgpm_stmt *stmt);
 static dsa_pointer pgpm_dsa_strdup(const char *str);
@@ -201,14 +203,15 @@ pgpm_store_get_all(Oid dbid)
  * is already known, or the statement has no plans yet and has been planned
  * fewer than min_plannings times. The first plan of a statement is
  * Approved, later ones Unapproved. If the plan is (now) in the baseline,
- * *status is set to its status.
+ * *plan_no and *status are set to its number and status.
  *
  * Called from the planner, so this never throws for lack of shared memory.
  */
 pgpm_capture_result
 pgpm_store_capture(Oid dbid, int64 queryId, const char *sql_text,
-				   int64 plan_hash, const char *outline, Cost total_cost,
-				   char origin, int min_plannings, char *status)
+				   const char *search_path, const char *role_name,
+				   const char *outline, Cost total_cost, char origin,
+				   int min_plannings, int *plan_no, char *status)
 {
 	pgpm_stmt_key key;
 	pgpm_stmt  *stmt;
@@ -219,7 +222,8 @@ pgpm_store_capture(Oid dbid, int64 queryId, const char *sql_text,
 	int			idx;
 
 	pgpm_init_key(&key, dbid, queryId);
-	stmt = pgpm_insert_stmt(&key, sql_text, true, &found);
+	stmt = pgpm_insert_stmt(&key, sql_text, search_path, role_name, true,
+							&found);
 	if (stmt == NULL)
 		return PGPM_CAPTURE_SKIPPED;
 	if (!found)
@@ -228,9 +232,10 @@ pgpm_store_capture(Oid dbid, int64 queryId, const char *sql_text,
 	plannings = pg_atomic_add_fetch_u64(&stmt->plannings, 1);
 
 	/* Already known? */
-	idx = pgpm_find_plan(stmt, plan_hash);
+	idx = pgpm_find_plan_by_outline(stmt, outline);
 	if (idx >= 0)
 	{
+		*plan_no = pgpm_stmt_plans(stmt)[idx].plan_no;
 		*status = pgpm_stmt_plans(stmt)[idx].status;
 		dshash_release_lock(pgpm_stmt_dshash, stmt);
 		return PGPM_CAPTURE_EXISTING;
@@ -249,7 +254,7 @@ pgpm_store_capture(Oid dbid, int64 queryId, const char *sql_text,
 		dshash_release_lock(pgpm_stmt_dshash, stmt);
 		return PGPM_CAPTURE_SKIPPED;
 	}
-	plan = pgpm_append_plan(stmt, true);
+	plan = pgpm_append_plan(stmt, 0, true);
 	if (plan == NULL)
 	{
 		dshash_release_lock(pgpm_stmt_dshash, stmt);
@@ -257,7 +262,6 @@ pgpm_store_capture(Oid dbid, int64 queryId, const char *sql_text,
 		return PGPM_CAPTURE_SKIPPED;
 	}
 
-	plan->plan_hash = plan_hash;
 	plan->status = stmt->nplans == 1 ? PGPM_STATUS_APPROVED :
 		PGPM_STATUS_UNAPPROVED;
 	plan->origin = origin;
@@ -266,6 +270,7 @@ pgpm_store_capture(Oid dbid, int64 queryId, const char *sql_text,
 	plan->total_cost = total_cost;
 	plan->created = GetCurrentTimestamp();
 	plan->outline = outline_dp;
+	*plan_no = plan->plan_no;
 	*status = plan->status;
 	dshash_release_lock(pgpm_stmt_dshash, stmt);
 
@@ -277,7 +282,7 @@ pgpm_store_capture(Oid dbid, int64 queryId, const char *sql_text,
  * Record that a plan was chosen during planning.
  */
 void
-pgpm_store_note_use(Oid dbid, int64 queryId, int64 plan_hash)
+pgpm_store_note_use(Oid dbid, int64 queryId, int plan_no)
 {
 	pgpm_stmt_key key;
 	pgpm_stmt  *stmt;
@@ -287,7 +292,7 @@ pgpm_store_note_use(Oid dbid, int64 queryId, int64 plan_hash)
 	stmt = dshash_find(pgpm_stmt_dshash, &key, false);
 	if (stmt == NULL)
 		return;
-	idx = pgpm_find_plan(stmt, plan_hash);
+	idx = pgpm_find_plan(stmt, plan_no);
 	if (idx >= 0)
 	{
 		pgpm_plan  *plan = &pgpm_stmt_plans(stmt)[idx];
@@ -306,7 +311,7 @@ pgpm_store_note_use(Oid dbid, int64 queryId, int64 plan_hash)
  * Record that a plan could not be enforced.
  */
 void
-pgpm_store_note_failure(Oid dbid, int64 queryId, int64 plan_hash)
+pgpm_store_note_failure(Oid dbid, int64 queryId, int plan_no)
 {
 	pgpm_stmt_key key;
 	pgpm_stmt  *stmt;
@@ -316,7 +321,7 @@ pgpm_store_note_failure(Oid dbid, int64 queryId, int64 plan_hash)
 	stmt = dshash_find(pgpm_stmt_dshash, &key, false);
 	if (stmt == NULL)
 		return;
-	idx = pgpm_find_plan(stmt, plan_hash);
+	idx = pgpm_find_plan(stmt, plan_no);
 	if (idx >= 0)
 		pg_atomic_add_fetch_u64(&pgpm_stmt_plans(stmt)[idx].failures, 1);
 	dshash_release_lock(pgpm_stmt_dshash, stmt);
@@ -329,7 +334,7 @@ pgpm_store_note_failure(Oid dbid, int64 queryId, int64 plan_hash)
  * Change the status of a plan. Returns false if there is no such plan.
  */
 bool
-pgpm_store_set_status(Oid dbid, int64 queryId, int64 plan_hash, char status)
+pgpm_store_set_status(Oid dbid, int64 queryId, int plan_no, char status)
 {
 	pgpm_stmt_key key;
 	pgpm_stmt  *stmt;
@@ -339,7 +344,7 @@ pgpm_store_set_status(Oid dbid, int64 queryId, int64 plan_hash, char status)
 	stmt = dshash_find(pgpm_stmt_dshash, &key, true);
 	if (stmt == NULL)
 		return false;
-	idx = pgpm_find_plan(stmt, plan_hash);
+	idx = pgpm_find_plan(stmt, plan_no);
 	if (idx >= 0)
 		pgpm_stmt_plans(stmt)[idx].status = status;
 	dshash_release_lock(pgpm_stmt_dshash, stmt);
@@ -354,8 +359,7 @@ pgpm_store_set_status(Oid dbid, int64 queryId, int64 plan_hash, char status)
  * Enable or disable a plan. Returns false if there is no such plan.
  */
 bool
-pgpm_store_set_enabled(Oid dbid, int64 queryId, int64 plan_hash,
-					   bool enabled)
+pgpm_store_set_enabled(Oid dbid, int64 queryId, int plan_no, bool enabled)
 {
 	pgpm_stmt_key key;
 	pgpm_stmt  *stmt;
@@ -365,7 +369,7 @@ pgpm_store_set_enabled(Oid dbid, int64 queryId, int64 plan_hash,
 	stmt = dshash_find(pgpm_stmt_dshash, &key, true);
 	if (stmt == NULL)
 		return false;
-	idx = pgpm_find_plan(stmt, plan_hash);
+	idx = pgpm_find_plan(stmt, plan_no);
 	if (idx >= 0)
 		pgpm_stmt_plans(stmt)[idx].enabled = enabled;
 	dshash_release_lock(pgpm_stmt_dshash, stmt);
@@ -381,8 +385,8 @@ pgpm_store_set_enabled(Oid dbid, int64 queryId, int64 plan_hash,
  * such plan.
  */
 bool
-pgpm_store_set_validation(Oid dbid, int64 queryId, int64 plan_hash,
-						  bool valid, Cost total_cost, TimestampTz when)
+pgpm_store_set_validation(Oid dbid, int64 queryId, int plan_no, bool valid,
+						  Cost total_cost, TimestampTz when)
 {
 	pgpm_stmt_key key;
 	pgpm_stmt  *stmt;
@@ -392,7 +396,7 @@ pgpm_store_set_validation(Oid dbid, int64 queryId, int64 plan_hash,
 	stmt = dshash_find(pgpm_stmt_dshash, &key, true);
 	if (stmt == NULL)
 		return false;
-	idx = pgpm_find_plan(stmt, plan_hash);
+	idx = pgpm_find_plan(stmt, plan_no);
 	if (idx >= 0)
 	{
 		pgpm_plan  *plan = &pgpm_stmt_plans(stmt)[idx];
@@ -411,12 +415,65 @@ pgpm_store_set_validation(Oid dbid, int64 queryId, int64 plan_hash,
 }
 
 /*
+ * Replace the outline of a plan. Returns false if there is no such plan, or
+ * another plan of the statement already has that outline.
+ */
+bool
+pgpm_store_set_outline(Oid dbid, int64 queryId, int plan_no,
+					   const char *outline)
+{
+	pgpm_stmt_key key;
+	pgpm_stmt  *stmt;
+	dsa_pointer outline_dp;
+	int			idx;
+	bool		ok = false;
+
+	outline_dp = pgpm_dsa_strdup(outline);
+	if (!DsaPointerIsValid(outline_dp))
+		ereport(ERROR,
+				errcode(ERRCODE_OUT_OF_MEMORY),
+				errmsg("out of memory"),
+				errdetail("Could not allocate shared memory for a plan outline."));
+
+	pgpm_init_key(&key, dbid, queryId);
+	stmt = dshash_find(pgpm_stmt_dshash, &key, true);
+	if (stmt == NULL)
+	{
+		dsa_free(pgpm_dsa_area, outline_dp);
+		return false;
+	}
+	idx = pgpm_find_plan(stmt, plan_no);
+	if (idx >= 0)
+	{
+		int			other = pgpm_find_plan_by_outline(stmt, outline);
+
+		if (other < 0 || other == idx)
+		{
+			pgpm_plan  *plan = &pgpm_stmt_plans(stmt)[idx];
+
+			dsa_free(pgpm_dsa_area, plan->outline);
+			plan->outline = outline_dp;
+			ok = true;
+		}
+	}
+	dshash_release_lock(pgpm_stmt_dshash, stmt);
+
+	if (!ok)
+	{
+		dsa_free(pgpm_dsa_area, outline_dp);
+		return false;
+	}
+	pg_atomic_add_fetch_u64(&pgpm_state->change_count, 1);
+	return true;
+}
+
+/*
  * Delete one plan, or all plans of a statement if all_plans is true.
  * A statement left without plans is deleted as well. Returns the number of
  * plans deleted.
  */
 int
-pgpm_store_delete(Oid dbid, int64 queryId, int64 plan_hash, bool all_plans)
+pgpm_store_delete(Oid dbid, int64 queryId, int plan_no, bool all_plans)
 {
 	pgpm_stmt_key key;
 	pgpm_stmt  *stmt;
@@ -431,7 +488,7 @@ pgpm_store_delete(Oid dbid, int64 queryId, int64 plan_hash, bool all_plans)
 		ndeleted = stmt->nplans;
 	else
 	{
-		int			idx = pgpm_find_plan(stmt, plan_hash);
+		int			idx = pgpm_find_plan(stmt, plan_no);
 
 		if (idx >= 0)
 		{
@@ -453,20 +510,23 @@ pgpm_store_delete(Oid dbid, int64 queryId, int64 plan_hash, bool all_plans)
 }
 
 /*
- * Create a statement entry, or update the existing one.
+ * Create a statement entry, or update the existing one. An existing entry
+ * keeps its text and environment.
  *
  * Unlike pgpm_store_capture, this throws errors; it's used by SQL functions
  * and when restoring from disk.
  */
 void
 pgpm_store_put_stmt(pgpm_stmt_key *key, const char *sql_text,
-					TimestampTz created, uint64 plannings,
+					const char *search_path, const char *role_name,
+					TimestampTz created, uint64 plannings, int next_plan_no,
 					bool enforce_limits)
 {
 	pgpm_stmt  *stmt;
 	bool		found;
 
-	stmt = pgpm_insert_stmt(key, sql_text, enforce_limits, &found);
+	stmt = pgpm_insert_stmt(key, sql_text, search_path, role_name,
+							enforce_limits, &found);
 	if (stmt == NULL)
 		ereport(ERROR,
 				errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
@@ -477,14 +537,20 @@ pgpm_store_put_stmt(pgpm_stmt_key *key, const char *sql_text,
 		stmt->created = created;
 	if (plannings > pg_atomic_read_u64(&stmt->plannings))
 		pg_atomic_write_u64(&stmt->plannings, plannings);
+	if (next_plan_no > stmt->next_plan_no)
+		stmt->next_plan_no = next_plan_no;
 	dshash_release_lock(pgpm_stmt_dshash, stmt);
 
 	pg_atomic_add_fetch_u64(&pgpm_state->change_count, 1);
 }
 
 /*
- * Store a plan for an existing statement, replacing any plan with the same
- * hash. Returns false if the statement does not exist or a limit was hit.
+ * Store a plan for an existing statement. If the statement already has a
+ * plan with the same outline, that plan is replaced and keeps its number;
+ * otherwise the plan is added under info->plan_no if that is set (restoring
+ * from disk), else under the next free number. On success info->plan_no is
+ * the number the plan ended up with. Returns false if the statement does not
+ * exist or a limit was hit.
  */
 bool
 pgpm_store_put_plan(pgpm_stmt_key *key, pgpm_plan_info *info,
@@ -509,20 +575,21 @@ pgpm_store_put_plan(pgpm_stmt_key *key, pgpm_plan_info *info,
 		return false;
 	}
 
-	idx = pgpm_find_plan(stmt, info->plan_hash);
+	idx = pgpm_find_plan_by_outline(stmt, info->outline);
 	if (idx >= 0)
 	{
 		plan = &pgpm_stmt_plans(stmt)[idx];
 		dsa_free(pgpm_dsa_area, plan->outline);
 	}
-	else if ((plan = pgpm_append_plan(stmt, enforce_limits)) == NULL)
+	else if ((plan = pgpm_append_plan(stmt, info->plan_no,
+									  enforce_limits)) == NULL)
 	{
 		dshash_release_lock(pgpm_stmt_dshash, stmt);
 		dsa_free(pgpm_dsa_area, outline_dp);
 		return false;
 	}
 
-	plan->plan_hash = info->plan_hash;
+	info->plan_no = plan->plan_no;
 	plan->status = info->status;
 	plan->origin = info->origin;
 	plan->enabled = info->enabled;
@@ -649,29 +716,20 @@ pgpm_init_key(pgpm_stmt_key *key, Oid dbid, int64 queryId)
 	key->queryId = queryId;
 }
 
-static void
-pgpm_init_stmt(pgpm_stmt *stmt, dsa_pointer sql_text, TimestampTz created,
-			   uint64 plannings)
-{
-	stmt->sql_text = sql_text;
-	stmt->created = created;
-	pg_atomic_init_u64(&stmt->plannings, plannings);
-	stmt->nplans = 0;
-	stmt->maxplans = 0;
-	stmt->plans = InvalidDsaPointer;
-}
-
 /*
  * Find or create a statement entry and return it locked exclusively, or
  * return NULL if it would exceed max_statements (when enforce_limits) or
- * shared memory is exhausted.
+ * shared memory is exhausted. The strings may be NULL, meaning empty.
  */
 static pgpm_stmt *
 pgpm_insert_stmt(pgpm_stmt_key *key, const char *sql_text,
+				 const char *search_path, const char *role_name,
 				 bool enforce_limits, bool *found)
 {
 	pgpm_stmt  *stmt;
-	dsa_pointer sql_dp;
+	dsa_pointer sql_dp = InvalidDsaPointer;
+	dsa_pointer path_dp = InvalidDsaPointer;
+	dsa_pointer role_dp = InvalidDsaPointer;
 
 	stmt = dshash_find(pgpm_stmt_dshash, key, true);
 	if (stmt != NULL)
@@ -689,24 +747,39 @@ pgpm_insert_stmt(pgpm_stmt_key *key, const char *sql_text,
 		return NULL;
 	}
 
-	sql_dp = pgpm_dsa_strdup(sql_text);
-	if (!DsaPointerIsValid(sql_dp))
-	{
-		pg_atomic_fetch_sub_u32(&pgpm_state->nstatements, 1);
-		return NULL;
-	}
+	sql_dp = pgpm_dsa_strdup(sql_text ? sql_text : "");
+	if (DsaPointerIsValid(sql_dp))
+		path_dp = pgpm_dsa_strdup(search_path ? search_path : "");
+	if (DsaPointerIsValid(path_dp))
+		role_dp = pgpm_dsa_strdup(role_name ? role_name : "");
+	if (DsaPointerIsValid(role_dp))
+		stmt = dshash_find_or_insert_extended(pgpm_stmt_dshash, key, found,
+											  DSHASH_INSERT_NO_OOM);
+	else
+		stmt = NULL;
 
-	stmt = dshash_find_or_insert_extended(pgpm_stmt_dshash, key, found,
-										  DSHASH_INSERT_NO_OOM);
 	if (stmt == NULL || *found)
 	{
 		/* Out of memory, or somebody else inserted it concurrently. */
 		pg_atomic_fetch_sub_u32(&pgpm_state->nstatements, 1);
-		dsa_free(pgpm_dsa_area, sql_dp);
+		if (DsaPointerIsValid(sql_dp))
+			dsa_free(pgpm_dsa_area, sql_dp);
+		if (DsaPointerIsValid(path_dp))
+			dsa_free(pgpm_dsa_area, path_dp);
+		if (DsaPointerIsValid(role_dp))
+			dsa_free(pgpm_dsa_area, role_dp);
 		return stmt;
 	}
 
-	pgpm_init_stmt(stmt, sql_dp, GetCurrentTimestamp(), 0);
+	stmt->sql_text = sql_dp;
+	stmt->search_path = path_dp;
+	stmt->role_name = role_dp;
+	stmt->created = GetCurrentTimestamp();
+	pg_atomic_init_u64(&stmt->plannings, 0);
+	stmt->next_plan_no = 1;
+	stmt->nplans = 0;
+	stmt->maxplans = 0;
+	stmt->plans = InvalidDsaPointer;
 	return stmt;
 }
 
@@ -719,13 +792,27 @@ pgpm_stmt_plans(pgpm_stmt *stmt)
 }
 
 static int
-pgpm_find_plan(pgpm_stmt *stmt, int64 plan_hash)
+pgpm_find_plan(pgpm_stmt *stmt, int plan_no)
 {
 	pgpm_plan  *plans = pgpm_stmt_plans(stmt);
 
 	for (int i = 0; i < stmt->nplans; i++)
 	{
-		if (plans[i].plan_hash == plan_hash)
+		if (plans[i].plan_no == plan_no)
+			return i;
+	}
+	return -1;
+}
+
+static int
+pgpm_find_plan_by_outline(pgpm_stmt *stmt, const char *outline)
+{
+	pgpm_plan  *plans = pgpm_stmt_plans(stmt);
+
+	for (int i = 0; i < stmt->nplans; i++)
+	{
+		if (strcmp(dsa_get_address(pgpm_dsa_area, plans[i].outline),
+				   outline) == 0)
 			return i;
 	}
 	return -1;
@@ -733,12 +820,14 @@ pgpm_find_plan(pgpm_stmt *stmt, int64 plan_hash)
 
 /*
  * Make room for one more plan and return a pointer to it, zero-initialized
- * apart from the atomics. Returns NULL if that would exceed max_plans (when
- * enforce_limits) or shared memory is exhausted. The caller must hold the
- * entry lock exclusively.
+ * apart from the atomics and the plan number. The plan gets number plan_no
+ * if that is positive (the caller must know it is unused), else the next
+ * free one; either way the statement's counter moves past it. Returns NULL
+ * if that would exceed max_plans (when enforce_limits) or shared memory is
+ * exhausted. The caller must hold the entry lock exclusively.
  */
 static pgpm_plan *
-pgpm_append_plan(pgpm_stmt *stmt, bool enforce_limits)
+pgpm_append_plan(pgpm_stmt *stmt, int plan_no, bool enforce_limits)
 {
 	pgpm_plan  *plan;
 
@@ -778,6 +867,11 @@ pgpm_append_plan(pgpm_stmt *stmt, bool enforce_limits)
 	plan = &((pgpm_plan *) dsa_get_address(pgpm_dsa_area,
 											stmt->plans))[stmt->nplans++];
 	memset(plan, 0, sizeof(pgpm_plan));
+	if (plan_no <= 0)
+		plan_no = stmt->next_plan_no;
+	plan->plan_no = plan_no;
+	if (plan_no >= stmt->next_plan_no)
+		stmt->next_plan_no = plan_no + 1;
 	pg_atomic_init_u64(&plan->last_used, 0);
 	pg_atomic_init_u64(&plan->plan_count, 0);
 	pg_atomic_init_u64(&plan->failures, 0);
@@ -821,9 +915,15 @@ pgpm_free_stmt(pgpm_stmt *stmt)
 		dsa_free(pgpm_dsa_area, stmt->plans);
 	if (DsaPointerIsValid(stmt->sql_text))
 		dsa_free(pgpm_dsa_area, stmt->sql_text);
+	if (DsaPointerIsValid(stmt->search_path))
+		dsa_free(pgpm_dsa_area, stmt->search_path);
+	if (DsaPointerIsValid(stmt->role_name))
+		dsa_free(pgpm_dsa_area, stmt->role_name);
 	stmt->nplans = 0;
 	stmt->plans = InvalidDsaPointer;
 	stmt->sql_text = InvalidDsaPointer;
+	stmt->search_path = InvalidDsaPointer;
+	stmt->role_name = InvalidDsaPointer;
 }
 
 /*
@@ -851,8 +951,13 @@ pgpm_copy_stmt(pgpm_stmt *stmt, pgpm_stmt_info *info)
 
 	info->key = stmt->key;
 	info->sql_text = pstrdup(dsa_get_address(pgpm_dsa_area, stmt->sql_text));
+	info->search_path = pstrdup(dsa_get_address(pgpm_dsa_area,
+												stmt->search_path));
+	info->role_name = pstrdup(dsa_get_address(pgpm_dsa_area,
+											  stmt->role_name));
 	info->created = stmt->created;
 	info->plannings = pg_atomic_read_u64(&stmt->plannings);
+	info->next_plan_no = stmt->next_plan_no;
 	info->nplans = stmt->nplans;
 	info->plans = stmt->nplans == 0 ? NULL :
 		palloc_array(pgpm_plan_info, stmt->nplans);
@@ -862,7 +967,7 @@ pgpm_copy_stmt(pgpm_stmt *stmt, pgpm_stmt_info *info)
 		pgpm_plan  *p = &plans[i];
 		pgpm_plan_info *pi = &info->plans[i];
 
-		pi->plan_hash = p->plan_hash;
+		pi->plan_no = p->plan_no;
 		pi->status = p->status;
 		pi->origin = p->origin;
 		pi->enabled = p->enabled;

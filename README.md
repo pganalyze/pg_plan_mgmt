@@ -53,6 +53,13 @@ SET pg_plan_mgmt.capture_plan_baselines = off;
 or for everything that is planned at least twice, with
 `pg_plan_mgmt.capture_plan_baselines = automatic` in `postgresql.conf`.
 
+Only superuser sessions capture. Planning happens before the executor checks
+permissions, and the first plan captured for a statement is Approved, so
+capturing from every session would let any user seed the baseline of a
+statement they may not even run. To capture in an application's environment,
+`SET ROLE` to its role in a superuser session; the statement is recorded with
+that role and `search_path`.
+
 Then enforce:
 
 ```sql
@@ -67,19 +74,20 @@ EXPLAIN SELECT ...;
    JOIN_ORDER(f d) /* matched */
    ...
  Plan Management: Approved plan used instead of minimum-cost plan
- Plan Hash: 4127... (Approved), Minimum-Cost Plan Hash: -9011... (Unapproved)
+ Baseline Plan: 1 (Approved), Minimum-Cost Plan: 2 (Unapproved)
 ```
 
-Review and manage plans:
+Review and manage plans. Within a statement, plans are numbered in the order
+they were added; the numbers are only meaningful on this server.
 
 ```sql
-SELECT query_id, plan_hash, status, enabled, valid, sql_text, plan_outline,
-       estimated_total_cost, last_used, plan_count
-  FROM plan_mgmt.dba_plans;
+SELECT query_id, plan_no, status, enabled, valid, sql_text, search_path,
+       role_name, plan_outline, estimated_total_cost, last_used, plan_count
+  FROM plan_mgmt.plans;
 
-SELECT plan_mgmt.set_plan_status(query_id, plan_hash, 'Approved');  -- or Preferred, Rejected, Unapproved
-SELECT plan_mgmt.set_plan_enabled(query_id, plan_hash, false);
-SELECT plan_mgmt.delete_plan(query_id, plan_hash);    -- plan_hash NULL: whole statement
+SELECT plan_mgmt.set_plan_status(query_id, plan_no, 'Approved');  -- or Preferred, Rejected, Unapproved
+SELECT plan_mgmt.set_plan_enabled(query_id, plan_no, false);
+SELECT plan_mgmt.delete_plan(query_id, plan_no);      -- plan_no NULL: whole statement
 SELECT * FROM plan_mgmt.validate_plans('update');     -- or 'disable', 'delete'
 SELECT plan_mgmt.reset();                             -- everything in this database
 ```
@@ -96,17 +104,33 @@ SELECT * FROM plan_mgmt.add_plan(
 ```
 
 `add_plan` computes the query ID from the statement text in the current
-database, so exporting `sql_text, plan_outline, status, enabled` from
-`dba_plans` and feeding the rows to `add_plan` moves baselines between
-environments.
+database and identifies the plan by its outline, so exporting `sql_text,
+plan_outline, status, enabled, search_path, role_name` from `plans` and
+feeding the rows to `add_plan` moves baselines between environments; plan
+numbers play no part in it.
+
+A statement is captured together with the `search_path` and the role it was
+first planned under, since both change what the planner sees (which table a
+name resolves to, row-level security policies, whether a SQL function can be
+inlined). `validate_plans` re-plans each statement in that environment, and
+`add_plan` plans in the session's environment unless `search_path` and
+`role_name` are given. Planning as another role requires having that role's
+privileges, as a superuser does; otherwise `validate_plans` reports the
+statement's plans with a NULL `valid` and the reason, and leaves them alone.
 
 All functions and the view are revoked from PUBLIC; grant access as needed.
+Note that each grant is database-wide: whoever can change a plan's status can
+change the plans of every statement in the database. Statement text is stored
+as submitted, constants included, and persisted to disk, so as in
+`pg_stat_statements` the `sql_text` column shows `<insufficient privilege>`
+unless the caller is a member of `pg_read_all_stats` or has the privileges of
+the role the statement was captured under.
 
 ## Configuration
 
 | GUC | default | |
 |---|---|---|
-| `pg_plan_mgmt.capture_plan_baselines` | `off` | `off`, `manual`, `automatic` (superuser) |
+| `pg_plan_mgmt.capture_plan_baselines` | `off` | `off`, `manual`, `automatic` (superuser; only superuser sessions capture) |
 | `pg_plan_mgmt.use_plan_baselines` | `off` | restrict planning to approved plans |
 | `pg_plan_mgmt.unapproved_plan_execution_threshold` | `0` | let unapproved plans cheaper than this run |
 | `pg_plan_mgmt.max_plans` | `10000` | capture stops when reached |

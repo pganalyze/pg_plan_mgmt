@@ -72,12 +72,12 @@ static bool pgpm_manageable_walker(Node *node,
 								   pgpm_manageable_context *context);
 static bool pgpm_plan_is_accepted(pgpm_plan_info *plan);
 static pgpm_plan_info *pgpm_find_plan_info(pgpm_stmt_info *stmt,
-										   int64 plan_hash);
+										   const char *outline);
 static char *pgpm_statement_text(const char *query_string, Query *parse);
 static bool pgpm_feedback_is_clean(List *feedback, StringInfo problems);
 static void pgpm_annotate(PlannedStmt *pstmt, const char *note,
-						  int64 plan_hash, const char *status,
-						  int64 min_plan_hash, const char *min_status);
+						  int plan_no, char status, bool show_min,
+						  int min_plan_no, char min_status);
 
 /*
  * Install planner-related hooks.
@@ -177,10 +177,7 @@ pgpm_plan_once(Query *parse, const char *query_string, int cursorOptions,
 	foreach_node(DefElem, item, pgpa_items)
 	{
 		if (strcmp(item->defname, "advice_string") == 0)
-		{
 			result->outline = strVal(item->arg);
-			result->plan_hash = pgpm_hash_outline(result->outline);
-		}
 		else if (strcmp(item->defname, "feedback") == 0 && outline != NULL)
 		{
 			StringInfoData problems;
@@ -277,7 +274,7 @@ pgpm_planner_guts(Query *parse, const char *query_string, int cursorOptions,
 				  ParamListInfo boundParams, ExplainState *es)
 {
 	pgpm_stmt_info *stmt;
-	bool		capture = pgpm_capture_plan_baselines != PGPM_CAPTURE_OFF;
+	bool		capture;
 	bool		may_enforce = false;
 	MemoryContext tmpcxt = NULL;
 	MemoryContext oldcxt = CurrentMemoryContext;
@@ -289,6 +286,18 @@ pgpm_planner_guts(Query *parse, const char *query_string, int cursorOptions,
 	pgpm_plan_info *chosen_plan = NULL;
 	const char *note = NULL;
 	PlannedStmt *result;
+
+	/*
+	 * Capture only in superuser sessions. Planning happens before the
+	 * executor checks permissions, so otherwise any user could get a
+	 * statement captured that they may not even run, and since the first
+	 * plan captured becomes Approved, seed the baseline that other sessions
+	 * then enforce. The session user is checked rather than the current user
+	 * so that a superuser can SET ROLE to the application's role and capture
+	 * in its environment.
+	 */
+	capture = pgpm_capture_plan_baselines != PGPM_CAPTURE_OFF &&
+		superuser_arg(GetSessionUserId());
 
 	/*
 	 * Quick exit if we have nothing to do. We also stay out of the way in
@@ -360,7 +369,7 @@ pgpm_planner_guts(Query *parse, const char *query_string, int cursorOptions,
 		return result;
 	}
 
-	min_plan = pgpm_find_plan_info(stmt, p0.plan_hash);
+	min_plan = pgpm_find_plan_info(stmt, p0.outline);
 	if (min_plan != NULL)
 		min_status = min_plan->status;
 
@@ -368,34 +377,51 @@ pgpm_planner_guts(Query *parse, const char *query_string, int cursorOptions,
 	if (capture)
 	{
 		bool		manual = pgpm_capture_plan_baselines == PGPM_CAPTURE_MANUAL;
+		char	   *sql_text = NULL;
+		const char *search_path = NULL;
+		char	   *role_name = NULL;
+		int			captured_no;
 		char		captured_status;
 		pgpm_capture_result cr;
 
+		/*
+		 * The statement's text and environment are only needed if its entry
+		 * has to be created, which is possible only if we didn't find one.
+		 */
+		if (stmt == NULL)
+		{
+			sql_text = pgpm_statement_text(query_string, parse);
+			search_path = GetConfigOption("search_path", false, false);
+			role_name = GetUserNameFromId(GetUserId(), false);
+		}
+
 		cr = pgpm_store_capture(MyDatabaseId, parse->queryId,
-								pgpm_statement_text(query_string, parse),
-								p0.plan_hash, p0.outline,
+								sql_text, search_path, role_name,
+								p0.outline,
 								p0.pstmt->planTree->total_cost,
 								manual ? PGPM_ORIGIN_MANUAL :
 								PGPM_ORIGIN_AUTOMATIC,
-								manual ? 1 : 2, &captured_status);
-		if (cr == PGPM_CAPTURE_ADDED)
+								manual ? 1 : 2, &captured_no,
+								&captured_status);
+		if (cr == PGPM_CAPTURE_ADDED ||
+			(cr == PGPM_CAPTURE_EXISTING && min_plan == NULL))
 		{
-			/* Pretend we knew about it all along. */
+			/*
+			 * Pretend we knew about it all along. (In the EXISTING case it
+			 * was captured concurrently since we looked.)
+			 */
 			min_plan = palloc0_object(pgpm_plan_info);
-			min_plan->plan_hash = p0.plan_hash;
+			min_plan->plan_no = captured_no;
 			min_plan->status = captured_status;
 			min_plan->enabled = true;
 			min_plan->valid = true;
+			min_plan->outline = p0.outline;
 			min_status = captured_status;
-			ereport(DEBUG1,
-					errmsg_internal("captured plan %" PRId64 " for query %" PRId64 " as %s",
-									p0.plan_hash, parse->queryId,
-									pgpm_status_name(captured_status)));
-		}
-		else if (cr == PGPM_CAPTURE_EXISTING && min_plan == NULL)
-		{
-			/* Captured concurrently since we looked. */
-			min_status = captured_status;
+			if (cr == PGPM_CAPTURE_ADDED)
+				ereport(DEBUG1,
+						errmsg_internal("captured plan %d for query %" PRId64 " as %s",
+										captured_no, parse->queryId,
+										pgpm_status_name(captured_status)));
 		}
 	}
 
@@ -451,19 +477,20 @@ pgpm_planner_guts(Query *parse, const char *query_string, int cursorOptions,
 				 * while constraining nothing. Require the plan we got to
 				 * regenerate the candidate's outline.
 				 */
-				if (pc.clean && pc.plan_hash != cand->plan_hash)
+				if (pc.clean &&
+					(pc.outline == NULL ||
+					 strcmp(pc.outline, cand->outline) != 0))
 				{
 					pc.clean = false;
-					pc.problems = psprintf("the outline was accepted but produced a different plan (plan hash %" PRId64 ")",
-										   pc.plan_hash);
+					pc.problems = "the outline was accepted but produced a different plan";
 				}
 				if (!pc.clean)
 				{
 					pgpm_store_note_failure(MyDatabaseId, parse->queryId,
-											cand->plan_hash);
+											cand->plan_no);
 					ereport(DEBUG1,
-							errmsg_internal("could not enforce plan %" PRId64 " for query %" PRId64 ": %s",
-											cand->plan_hash, parse->queryId,
+							errmsg_internal("could not enforce plan %d for query %" PRId64 ": %s",
+											cand->plan_no, parse->queryId,
 											pc.problems));
 					continue;
 				}
@@ -494,19 +521,15 @@ pgpm_planner_guts(Query *parse, const char *query_string, int cursorOptions,
 	result = tmpcxt != NULL ? copyObject(chosen) : chosen;
 
 	if (chosen_plan != NULL && chosen != p0.pstmt)
-		pgpm_annotate(result, note,
-					  chosen_plan->plan_hash,
-					  pgpm_status_name(chosen_plan->status),
-					  p0.plan_hash,
-					  min_status ? pgpm_status_name(min_status) : "Not Captured");
+		pgpm_annotate(result, note, chosen_plan->plan_no, chosen_plan->status,
+					  true, min_plan ? min_plan->plan_no : 0, min_status);
 	else
-		pgpm_annotate(result, note, p0.plan_hash,
-					  min_status ? pgpm_status_name(min_status) : "Not Captured",
-					  0, NULL);
+		pgpm_annotate(result, note, min_plan ? min_plan->plan_no : 0,
+					  min_status, false, 0, 0);
 
 	if (chosen_plan != NULL)
 		pgpm_store_note_use(MyDatabaseId, parse->queryId,
-							chosen_plan->plan_hash);
+							chosen_plan->plan_no);
 
 	if (tmpcxt != NULL)
 		MemoryContextDelete(tmpcxt);
@@ -538,13 +561,13 @@ pgpm_plan_is_accepted(pgpm_plan_info *plan)
 }
 
 static pgpm_plan_info *
-pgpm_find_plan_info(pgpm_stmt_info *stmt, int64 plan_hash)
+pgpm_find_plan_info(pgpm_stmt_info *stmt, const char *outline)
 {
 	if (stmt == NULL)
 		return NULL;
 	for (int i = 0; i < stmt->nplans; i++)
 	{
-		if (stmt->plans[i].plan_hash == plan_hash)
+		if (strcmp(stmt->plans[i].outline, outline) == 0)
 			return &stmt->plans[i];
 	}
 	return NULL;
@@ -735,11 +758,13 @@ pgpm_feedback_is_clean(List *feedback, StringInfo problems)
 }
 
 /*
- * Record what we did in the PlannedStmt, for EXPLAIN.
+ * Record what we did in the PlannedStmt, for EXPLAIN: the plan that was
+ * chosen, and, if a different one was the minimum-cost plan, that one too.
+ * A plan number of 0 and a status of 0 mean the plan is not in the baseline.
  */
 static void
-pgpm_annotate(PlannedStmt *pstmt, const char *note, int64 plan_hash,
-			  const char *status, int64 min_plan_hash, const char *min_status)
+pgpm_annotate(PlannedStmt *pstmt, const char *note, int plan_no, char status,
+			  bool show_min, int min_plan_no, char min_status)
 {
 	List	   *items = NIL;
 
@@ -747,24 +772,23 @@ pgpm_annotate(PlannedStmt *pstmt, const char *note, int64 plan_hash,
 		items = lappend(items, makeDefElem("note",
 										   (Node *) makeString(pstrdup(note)),
 										   -1));
+	if (plan_no > 0)
+		items = lappend(items, makeDefElem("plan_no",
+										   (Node *) makeInteger(plan_no), -1));
 	items = lappend(items,
-					makeDefElem("plan_hash",
-								(Node *) makeString(psprintf("%" PRId64,
-															 plan_hash)),
+					makeDefElem("status",
+								(Node *) makeString(pstrdup(status ? pgpm_status_name(status) : "Not Captured")),
 								-1));
-	items = lappend(items, makeDefElem("status",
-									   (Node *) makeString(pstrdup(status)),
-									   -1));
-	if (min_plan_hash != 0)
+	if (show_min)
 	{
-		items = lappend(items,
-						makeDefElem("min_cost_plan_hash",
-									(Node *) makeString(psprintf("%" PRId64,
-																 min_plan_hash)),
-									-1));
+		if (min_plan_no > 0)
+			items = lappend(items,
+							makeDefElem("min_cost_plan_no",
+										(Node *) makeInteger(min_plan_no),
+										-1));
 		items = lappend(items,
 						makeDefElem("min_cost_status",
-									(Node *) makeString(pstrdup(min_status)),
+									(Node *) makeString(pstrdup(min_status ? pgpm_status_name(min_status) : "Not Captured")),
 									-1));
 	}
 

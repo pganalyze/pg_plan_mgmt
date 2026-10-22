@@ -15,7 +15,6 @@
 
 #include "commands/explain.h"
 #include "commands/explain_format.h"
-#include "common/hashfn.h"
 #include "fmgr.h"
 #include "miscadmin.h"
 #include "nodes/queryjumble.h"
@@ -72,7 +71,7 @@ _PG_init(void)
 
 	DefineCustomEnumVariable("pg_plan_mgmt.capture_plan_baselines",
 							 "Captures plans of planned statements into their plan baselines.",
-							 "\"manual\" captures every statement, \"automatic\" captures statements planned at least twice.",
+							 "\"manual\" captures every statement, \"automatic\" captures statements planned at least twice. Only superuser sessions capture.",
 							 &pgpm_capture_plan_baselines,
 							 PGPM_CAPTURE_OFF,
 							 capture_options,
@@ -269,23 +268,6 @@ pgpm_parse_origin(const char *name)
 }
 
 /*
- * Compute the plan hash of an outline.
- *
- * Zero is reserved to mean "no plan", so map it to something else.
- */
-int64
-pgpm_hash_outline(const char *outline)
-{
-	uint64		h;
-
-	h = hash_bytes_extended((const unsigned char *) outline,
-							strlen(outline), 0);
-	if (h == 0)
-		h = 1;
-	return (int64) h;
-}
-
-/*
  * Start our worker process.
  */
 void
@@ -324,6 +306,33 @@ find_defelem_by_defname(List *deflist, const char *defname)
 }
 
 /*
+ * Describe a plan for EXPLAIN: its number and status, or that it was not
+ * captured. In text format this is one "N (Status)" string under label; in
+ * other formats the number and status are separate properties.
+ */
+static void
+pgpm_explain_plan_ref(ExplainState *es, const char *label, StringInfo buf,
+					  DefElem *plan_no, DefElem *status)
+{
+	if (es->format == EXPLAIN_FORMAT_TEXT)
+	{
+		if (plan_no != NULL)
+			appendStringInfo(buf, "%s: %d (%s)", label, intVal(plan_no->arg),
+							 strVal(status->arg));
+		else
+			appendStringInfo(buf, "%s: not captured", label);
+	}
+	else
+	{
+		if (plan_no != NULL)
+			ExplainPropertyInteger(psprintf("%s Number", label), NULL,
+								   intVal(plan_no->arg), es);
+		ExplainPropertyText(psprintf("%s Status", label),
+							strVal(status->arg), es);
+	}
+}
+
+/*
  * Add the plan management decision, if any, to the EXPLAIN output.
  */
 static void
@@ -337,10 +346,8 @@ pgpm_explain_per_plan(PlannedStmt *plannedstmt,
 	DefElem    *pgpm_item;
 	List	   *items;
 	DefElem    *note;
-	DefElem    *plan_hash;
-	DefElem    *status;
-	DefElem    *min_plan_hash;
 	DefElem    *min_status;
+	StringInfoData buf;
 
 	if (prev_explain_per_plan)
 		prev_explain_per_plan(plannedstmt, into, es, queryString, params,
@@ -353,37 +360,26 @@ pgpm_explain_per_plan(PlannedStmt *plannedstmt,
 	items = (List *) pgpm_item->arg;
 
 	note = find_defelem_by_defname(items, "note");
-	plan_hash = find_defelem_by_defname(items, "plan_hash");
-	status = find_defelem_by_defname(items, "status");
-	min_plan_hash = find_defelem_by_defname(items, "min_cost_plan_hash");
-	min_status = find_defelem_by_defname(items, "min_cost_status");
-
 	if (note != NULL)
 		ExplainPropertyText("Plan Management", strVal(note->arg), es);
 
+	initStringInfo(&buf);
+	pgpm_explain_plan_ref(es, "Baseline Plan", &buf,
+						  find_defelem_by_defname(items, "plan_no"),
+						  find_defelem_by_defname(items, "status"));
+
+	min_status = find_defelem_by_defname(items, "min_cost_status");
+	if (min_status != NULL)
+	{
+		appendStringInfoString(&buf, ", ");
+		pgpm_explain_plan_ref(es, "Minimum-Cost Plan", &buf,
+							  find_defelem_by_defname(items, "min_cost_plan_no"),
+							  min_status);
+	}
+
 	if (es->format == EXPLAIN_FORMAT_TEXT)
 	{
-		StringInfoData buf;
-
-		initStringInfo(&buf);
-		appendStringInfo(&buf, "%s (%s)",
-						 strVal(plan_hash->arg), strVal(status->arg));
-		if (min_plan_hash != NULL)
-			appendStringInfo(&buf, ", Minimum-Cost Plan Hash: %s (%s)",
-							 strVal(min_plan_hash->arg),
-							 strVal(min_status->arg));
-		ExplainPropertyText("Plan Hash", buf.data, es);
-	}
-	else
-	{
-		ExplainPropertyText("Plan Hash", strVal(plan_hash->arg), es);
-		ExplainPropertyText("Plan Status", strVal(status->arg), es);
-		if (min_plan_hash != NULL)
-		{
-			ExplainPropertyText("Minimum-Cost Plan Hash",
-								strVal(min_plan_hash->arg), es);
-			ExplainPropertyText("Minimum-Cost Plan Status",
-								strVal(min_status->arg), es);
-		}
+		ExplainIndentText(es);
+		appendStringInfo(es->str, "%s\n", buf.data);
 	}
 }

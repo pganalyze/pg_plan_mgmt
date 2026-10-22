@@ -63,10 +63,15 @@ typedef struct pgpm_stmt_key
  * their statement entry. The atomics are bumped during planning while only
  * holding the entry's lock in shared mode; everything else is modified only
  * while holding it exclusively.
+ *
+ * A plan's identity is its outline; two plans of a statement never have the
+ * same outline. The plan number is a per-statement ordinal, assigned when the
+ * plan is added and never reused, that the SQL interface and EXPLAIN use to
+ * refer to the plan. It has no meaning outside this server.
  */
 typedef struct pgpm_plan
 {
-	int64		plan_hash;
+	int			plan_no;
 	char		status;
 	char		origin;
 	bool		enabled;
@@ -83,6 +88,10 @@ typedef struct pgpm_plan
 /*
  * A managed statement in shared memory.
  *
+ * Along with its text we keep the environment the statement was first
+ * captured in, as far as it affects planning: the search_path and the role.
+ * validate_plans() re-plans the text in that environment.
+ *
  * In automatic capture mode a statement entry is created the first time a
  * statement is planned, with no plans; "plannings" counts how often it was
  * planned so that capture can begin with the second planning.
@@ -91,8 +100,11 @@ typedef struct pgpm_stmt
 {
 	pgpm_stmt_key key;
 	dsa_pointer sql_text;
+	dsa_pointer search_path;
+	dsa_pointer role_name;
 	TimestampTz created;
 	pg_atomic_uint64 plannings;
+	int			next_plan_no;	/* number for the next plan added */
 	int			nplans;
 	int			maxplans;
 	dsa_pointer plans;
@@ -120,7 +132,7 @@ typedef struct pgpm_shared_state
  */
 typedef struct pgpm_plan_info
 {
-	int64		plan_hash;
+	int			plan_no;
 	char		status;
 	char		origin;
 	bool		enabled;
@@ -141,8 +153,11 @@ typedef struct pgpm_stmt_info
 {
 	pgpm_stmt_key key;
 	char	   *sql_text;
+	char	   *search_path;
+	char	   *role_name;
 	TimestampTz created;
 	uint64		plannings;
+	int			next_plan_no;
 	int			nplans;
 	pgpm_plan_info *plans;
 } pgpm_stmt_info;
@@ -164,7 +179,6 @@ typedef struct pgpm_planned
 {
 	PlannedStmt *pstmt;
 	char	   *outline;		/* generated advice for the plan, or NULL */
-	int64		plan_hash;		/* hash of outline, 0 if no outline */
 	bool		clean;			/* supplied outline was fully enforced */
 	char	   *problems;		/* if not clean, description of why */
 } pgpm_planned;
@@ -190,7 +204,6 @@ extern const char *pgpm_status_name(char status);
 extern char pgpm_parse_status(const char *name);
 extern const char *pgpm_origin_name(char origin);
 extern char pgpm_parse_origin(const char *name);
-extern int64 pgpm_hash_outline(const char *outline);
 extern void pgpm_start_worker(void);
 
 /* pgpm_planner.c */
@@ -212,25 +225,30 @@ extern pgpm_stmt_info *pgpm_store_lookup(Oid dbid, int64 queryId);
 extern List *pgpm_store_get_all(Oid dbid);
 extern pgpm_capture_result pgpm_store_capture(Oid dbid, int64 queryId,
 											  const char *sql_text,
-											  int64 plan_hash,
+											  const char *search_path,
+											  const char *role_name,
 											  const char *outline,
 											  Cost total_cost, char origin,
 											  int min_plannings,
-											  char *status);
-extern void pgpm_store_note_use(Oid dbid, int64 queryId, int64 plan_hash);
-extern void pgpm_store_note_failure(Oid dbid, int64 queryId, int64 plan_hash);
-extern bool pgpm_store_set_status(Oid dbid, int64 queryId, int64 plan_hash,
+											  int *plan_no, char *status);
+extern void pgpm_store_note_use(Oid dbid, int64 queryId, int plan_no);
+extern void pgpm_store_note_failure(Oid dbid, int64 queryId, int plan_no);
+extern bool pgpm_store_set_status(Oid dbid, int64 queryId, int plan_no,
 								  char status);
-extern bool pgpm_store_set_enabled(Oid dbid, int64 queryId, int64 plan_hash,
+extern bool pgpm_store_set_enabled(Oid dbid, int64 queryId, int plan_no,
 								   bool enabled);
-extern bool pgpm_store_set_validation(Oid dbid, int64 queryId,
-									  int64 plan_hash, bool valid,
-									  Cost total_cost, TimestampTz when);
-extern int	pgpm_store_delete(Oid dbid, int64 queryId, int64 plan_hash,
+extern bool pgpm_store_set_validation(Oid dbid, int64 queryId, int plan_no,
+									  bool valid, Cost total_cost,
+									  TimestampTz when);
+extern bool pgpm_store_set_outline(Oid dbid, int64 queryId, int plan_no,
+								   const char *outline);
+extern int	pgpm_store_delete(Oid dbid, int64 queryId, int plan_no,
 							  bool all_plans);
 extern void pgpm_store_put_stmt(pgpm_stmt_key *key, const char *sql_text,
+								const char *search_path,
+								const char *role_name,
 								TimestampTz created, uint64 plannings,
-								bool enforce_limits);
+								int next_plan_no, bool enforce_limits);
 extern bool pgpm_store_put_plan(pgpm_stmt_key *key, pgpm_plan_info *plan,
 								bool enforce_limits);
 extern void pgpm_store_reset(Oid dbid);
