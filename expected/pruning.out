@@ -1,0 +1,81 @@
+-- An approved outline is enforced only if the plan it produces regenerates
+-- that outline. Plan-time partition pruning is the common way for an outline
+-- not to apply: its items name partitions that are absent this time, so
+-- pg_plan_advice reports no problems, but nothing was constrained.
+CREATE TABLE pm_part (k int, v int) PARTITION BY LIST (k);
+CREATE TABLE pm_part1 PARTITION OF pm_part FOR VALUES IN (1)
+	WITH (autovacuum_enabled = false);
+CREATE TABLE pm_part2 PARTITION OF pm_part FOR VALUES IN (2)
+	WITH (autovacuum_enabled = false);
+INSERT INTO pm_part SELECT 1 + g % 2, g % 100 FROM generate_series(1, 20000) g;
+CREATE INDEX pm_part_v_idx ON pm_part (v);
+VACUUM ANALYZE pm_part1, pm_part2;
+SET pg_plan_mgmt.capture_plan_baselines = manual;
+SELECT explain_masked('SELECT count(*) FROM pm_part WHERE k = 1 AND v = 1');
+                      explain_masked                       
+-----------------------------------------------------------
+ Aggregate
+   ->  Index Scan using pm_part1_v_idx on pm_part1 pm_part
+         Index Cond: (v = 1)
+         Filter: (k = 1)
+ Plan Hash: N (Approved)
+(5 rows)
+
+SET pg_plan_mgmt.capture_plan_baselines = off;
+SELECT status, plan_outline FROM plan_mgmt.dba_plans;
+  status  |                       plan_outline                        
+----------+-----------------------------------------------------------
+ Approved | INDEX_SCAN(pm_part/public.pm_part1 public.pm_part1_v_idx)+
+          | PARTITIONWISE(pm_part)                                   +
+          | NO_GATHER(pm_part pm_part/public.pm_part1)
+(1 row)
+
+SET enable_indexscan = off;
+SET enable_bitmapscan = off;
+SET pg_plan_mgmt.use_plan_baselines = on;
+-- Same partition: the approved plan is enforced.
+SELECT explain_masked('SELECT count(*) FROM pm_part WHERE k = 1 AND v = 1');
+                              explain_masked                               
+---------------------------------------------------------------------------
+ Aggregate
+   ->  Index Scan using pm_part1_v_idx on pm_part1 pm_part
+         Disabled: true
+         Index Cond: (v = 1)
+         Filter: (k = 1)
+ Supplied Plan Advice:
+   INDEX_SCAN(pm_part/public.pm_part1 public.pm_part1_v_idx) /* matched */
+   PARTITIONWISE(pm_part) /* matched */
+   NO_GATHER(pm_part) /* matched */
+   NO_GATHER(pm_part/public.pm_part1) /* matched */
+ Plan Management: Approved plan used instead of minimum-cost plan
+ Plan Hash: N (Approved), Minimum-Cost Plan Hash: N (Not Captured)
+(12 rows)
+
+-- Other partition: the outline produces a different plan, which must not be
+-- passed off as the approved one.
+SELECT explain_masked('SELECT count(*) FROM pm_part WHERE k = 2 AND v = 1');
+                               explain_masked                                
+-----------------------------------------------------------------------------
+ Aggregate
+   ->  Seq Scan on pm_part2 pm_part
+         Filter: ((k = 2) AND (v = 1))
+ Plan Management: No approved plan could be enforced, minimum-cost plan used
+ Plan Hash: N (Not Captured)
+(5 rows)
+
+SELECT status, plan_count, enforcement_failures FROM plan_mgmt.dba_plans;
+  status  | plan_count | enforcement_failures 
+----------+------------+----------------------
+ Approved |          2 |                    1
+(1 row)
+
+RESET enable_indexscan;
+RESET enable_bitmapscan;
+RESET pg_plan_mgmt.use_plan_baselines;
+SELECT plan_mgmt.reset();
+ reset 
+-------
+ 
+(1 row)
+
+DROP TABLE pm_part;

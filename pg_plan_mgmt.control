@@ -1,0 +1,6 @@
+# pg_plan_mgmt extension
+comment = 'plan baselines: capture plans and restrict the planner to approved ones'
+default_version = '1.0'
+module_pathname = '$libdir/pg_plan_mgmt'
+relocatable = false
+schema = plan_mgmt

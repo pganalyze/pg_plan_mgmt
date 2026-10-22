@@ -1,0 +1,249 @@
+SET pg_plan_mgmt.capture_plan_baselines = manual;
+-- Capture the default plan (Approved) and an index-heavy one (Unapproved).
+SELECT explain_masked('SELECT * FROM pm_fact f JOIN pm_dim d ON f.dim_id = d.id WHERE d.val = 1');
+          explain_masked          
+----------------------------------
+ Hash Join
+   Hash Cond: (f.dim_id = d.id)
+   ->  Seq Scan on pm_fact f
+   ->  Hash
+         ->  Seq Scan on pm_dim d
+               Filter: (val = 1)
+ Plan Hash: N (Approved)
+(7 rows)
+
+SET random_page_cost = 0.1;
+SET cpu_index_tuple_cost = 0;
+SELECT explain_masked('SELECT * FROM pm_fact f JOIN pm_dim d ON f.dim_id = d.id WHERE d.val = 1');
+                     explain_masked                     
+--------------------------------------------------------
+ Nested Loop
+   ->  Index Scan using pm_dim_pkey on pm_dim d
+         Filter: (val = 1)
+   ->  Index Scan using pm_fact_dim_id_idx on pm_fact f
+         Index Cond: (dim_id = d.id)
+ Plan Hash: N (Unapproved)
+(6 rows)
+
+SET pg_plan_mgmt.capture_plan_baselines = off;
+SELECT query_id AS qid FROM plan_mgmt.dba_plans LIMIT 1 \gset
+SELECT plan_hash AS approved FROM plan_mgmt.dba_plans WHERE status = 'Approved' \gset
+SELECT plan_hash AS unapproved FROM plan_mgmt.dba_plans WHERE status = 'Unapproved' \gset
+-- Under the changed costs, the Approved plan is enforced.
+SET pg_plan_mgmt.use_plan_baselines = on;
+SELECT explain_masked('SELECT * FROM pm_fact f JOIN pm_dim d ON f.dim_id = d.id WHERE d.val = 1');
+                          explain_masked                          
+------------------------------------------------------------------
+ Hash Join
+   Hash Cond: (f.dim_id = d.id)
+   ->  Seq Scan on pm_fact f
+   ->  Hash
+         ->  Seq Scan on pm_dim d
+               Filter: (val = 1)
+ Supplied Plan Advice:
+   SEQ_SCAN(f) /* matched */
+   SEQ_SCAN(d) /* matched */
+   JOIN_ORDER(f d) /* matched */
+   HASH_JOIN(d) /* matched */
+   NO_GATHER(f) /* matched */
+   NO_GATHER(d) /* matched */
+ Plan Management: Approved plan used instead of minimum-cost plan
+ Plan Hash: N (Approved), Minimum-Cost Plan Hash: N (Unapproved)
+(15 rows)
+
+SELECT count(*) FROM pm_fact f JOIN pm_dim d ON f.dim_id = d.id WHERE d.val = 1;
+ count 
+-------
+  2000
+(1 row)
+
+-- A cheap enough Unapproved plan may run.
+SET pg_plan_mgmt.unapproved_plan_execution_threshold = 1e9;
+SELECT explain_masked('SELECT * FROM pm_fact f JOIN pm_dim d ON f.dim_id = d.id WHERE d.val = 1');
+                                           explain_masked                                            
+-----------------------------------------------------------------------------------------------------
+ Nested Loop
+   ->  Index Scan using pm_dim_pkey on pm_dim d
+         Filter: (val = 1)
+   ->  Index Scan using pm_fact_dim_id_idx on pm_fact f
+         Index Cond: (dim_id = d.id)
+ Plan Management: Unapproved plan used because its cost is below unapproved_plan_execution_threshold
+ Plan Hash: N (Unapproved)
+(7 rows)
+
+RESET pg_plan_mgmt.unapproved_plan_execution_threshold;
+-- Once approved, the minimum-cost plan is used as is.
+SELECT plan_mgmt.set_plan_status(:qid, :unapproved, 'approved');
+ set_plan_status 
+-----------------
+ 
+(1 row)
+
+SELECT explain_masked('SELECT * FROM pm_fact f JOIN pm_dim d ON f.dim_id = d.id WHERE d.val = 1');
+                     explain_masked                     
+--------------------------------------------------------
+ Nested Loop
+   ->  Index Scan using pm_dim_pkey on pm_dim d
+         Filter: (val = 1)
+   ->  Index Scan using pm_fact_dim_id_idx on pm_fact f
+         Index Cond: (dim_id = d.id)
+ Plan Hash: N (Approved)
+(6 rows)
+
+-- A Preferred plan wins over the minimum-cost plan unless that is approved.
+SELECT plan_mgmt.set_plan_status(:qid, :unapproved, 'Rejected');
+ set_plan_status 
+-----------------
+ 
+(1 row)
+
+SELECT plan_mgmt.set_plan_status(:qid, :approved, 'Preferred');
+ set_plan_status 
+-----------------
+ 
+(1 row)
+
+SELECT explain_masked('SELECT * FROM pm_fact f JOIN pm_dim d ON f.dim_id = d.id WHERE d.val = 1');
+                          explain_masked                           
+-------------------------------------------------------------------
+ Hash Join
+   Hash Cond: (f.dim_id = d.id)
+   ->  Seq Scan on pm_fact f
+   ->  Hash
+         ->  Seq Scan on pm_dim d
+               Filter: (val = 1)
+ Supplied Plan Advice:
+   SEQ_SCAN(f) /* matched */
+   SEQ_SCAN(d) /* matched */
+   JOIN_ORDER(f d) /* matched */
+   HASH_JOIN(d) /* matched */
+   NO_GATHER(f) /* matched */
+   NO_GATHER(d) /* matched */
+ Plan Management: Preferred plan used instead of minimum-cost plan
+ Plan Hash: N (Preferred), Minimum-Cost Plan Hash: N (Rejected)
+(15 rows)
+
+-- Disabled plans are not used.
+SELECT plan_mgmt.set_plan_enabled(:qid, :approved, false);
+ set_plan_enabled 
+------------------
+ 
+(1 row)
+
+SELECT explain_masked('SELECT * FROM pm_fact f JOIN pm_dim d ON f.dim_id = d.id WHERE d.val = 1');
+                             explain_masked                             
+------------------------------------------------------------------------
+ Nested Loop
+   ->  Index Scan using pm_dim_pkey on pm_dim d
+         Filter: (val = 1)
+   ->  Index Scan using pm_fact_dim_id_idx on pm_fact f
+         Index Cond: (dim_id = d.id)
+ Plan Management: No approved plan is available, minimum-cost plan used
+ Plan Hash: N (Rejected)
+(7 rows)
+
+SELECT plan_mgmt.set_plan_enabled(:qid, :approved, true);
+ set_plan_enabled 
+------------------
+ 
+(1 row)
+
+-- Prepared statements have their own query ID, and so their own baseline.
+PREPARE pm_stmt(int) AS
+	SELECT * FROM pm_fact f JOIN pm_dim d ON f.dim_id = d.id WHERE d.val = $1;
+SELECT explain_masked('EXECUTE pm_stmt(1)');
+                     explain_masked                     
+--------------------------------------------------------
+ Nested Loop
+   ->  Index Scan using pm_dim_pkey on pm_dim d
+         Filter: (val = 1)
+   ->  Index Scan using pm_fact_dim_id_idx on pm_fact f
+         Index Cond: (dim_id = d.id)
+(5 rows)
+
+SELECT plan_mgmt.add_plan(
+	'SELECT * FROM pm_fact f JOIN pm_dim d ON f.dim_id = d.id WHERE d.val = $1',
+	plan_outline, 'Approved') IS NOT NULL
+  FROM plan_mgmt.dba_plans WHERE plan_hash = :approved;
+ ?column? 
+----------
+ t
+(1 row)
+
+SELECT explain_masked('EXECUTE pm_stmt(1)');
+                          explain_masked                           
+-------------------------------------------------------------------
+ Hash Join
+   Hash Cond: (f.dim_id = d.id)
+   ->  Seq Scan on pm_fact f
+   ->  Hash
+         ->  Seq Scan on pm_dim d
+               Filter: (val = 1)
+ Supplied Plan Advice:
+   SEQ_SCAN(f) /* matched */
+   SEQ_SCAN(d) /* matched */
+   JOIN_ORDER(f d) /* matched */
+   HASH_JOIN(d) /* matched */
+   NO_GATHER(f) /* matched */
+   NO_GATHER(d) /* matched */
+ Plan Management: Approved plan used instead of minimum-cost plan
+ Plan Hash: N (Approved), Minimum-Cost Plan Hash: N (Not Captured)
+(15 rows)
+
+DEALLOCATE pm_stmt;
+-- If the approved plans can't be enforced any more, fall back.
+SELECT plan_mgmt.set_plan_status(:qid, :approved, 'Rejected');
+ set_plan_status 
+-----------------
+ 
+(1 row)
+
+SELECT plan_mgmt.set_plan_status(:qid, :unapproved, 'Preferred');
+ set_plan_status 
+-----------------
+ 
+(1 row)
+
+SELECT explain_masked('SELECT * FROM pm_fact f JOIN pm_dim d ON f.dim_id = d.id WHERE d.val = 1');
+                     explain_masked                     
+--------------------------------------------------------
+ Nested Loop
+   ->  Index Scan using pm_dim_pkey on pm_dim d
+         Filter: (val = 1)
+   ->  Index Scan using pm_fact_dim_id_idx on pm_fact f
+         Index Cond: (dim_id = d.id)
+ Plan Hash: N (Preferred)
+(6 rows)
+
+DROP INDEX pm_fact_dim_id_idx;
+SELECT explain_masked('SELECT * FROM pm_fact f JOIN pm_dim d ON f.dim_id = d.id WHERE d.val = 1');
+                               explain_masked                                
+-----------------------------------------------------------------------------
+ Hash Join
+   Hash Cond: (f.dim_id = d.id)
+   ->  Seq Scan on pm_fact f
+   ->  Hash
+         ->  Index Scan using pm_dim_pkey on pm_dim d
+               Filter: (val = 1)
+ Plan Management: No approved plan could be enforced, minimum-cost plan used
+ Plan Hash: N (Not Captured)
+(8 rows)
+
+SELECT status, enforcement_failures > 0 AS failed FROM plan_mgmt.dba_plans
+ WHERE query_id = :qid ORDER BY status;
+  status   | failed 
+-----------+--------
+ Preferred | t
+ Rejected  | f
+(2 rows)
+
+CREATE INDEX pm_fact_dim_id_idx ON pm_fact (dim_id);
+RESET random_page_cost;
+RESET cpu_index_tuple_cost;
+RESET pg_plan_mgmt.use_plan_baselines;
+SELECT plan_mgmt.reset();
+ reset 
+-------
+ 
+(1 row)
+
